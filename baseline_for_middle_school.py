@@ -9,7 +9,7 @@ from sklearn.linear_model import LinearRegression
 
 
 nwps = ['NWP_1','NWP_2','NWP_3']
-fact_path = '数据集/middle_school/TRAIN/fact_data'
+fact_path = 'training/middle_school/TRAIN/fact_data'
 
 def data_preprocess(x_df, y_df):
     x_df = x_df.dropna()
@@ -22,7 +22,7 @@ def data_preprocess(x_df, y_df):
 
 def train(farm_id):
     x_df = pd.DataFrame()
-    nwp_train_path = f'数据集/middle_school/TRAIN/nwp_data_train/{farm_id}'
+    nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
     for nwp in nwps:
         nwp_path = os.path.join(nwp_train_path,nwp,)
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
@@ -48,7 +48,7 @@ def train(farm_id):
 
 def predict(model,farm_id):
     x_df = pd.DataFrame()
-    nwp_test_path = f'数据集/middle_school/TEST/nwp_data_test/{farm_id}'
+    nwp_test_path = f'training/middle_school/TEST/nwp_data_test/{farm_id}'
     for nwp in nwps:
         nwp_path = os.path.join(nwp_test_path, nwp)
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
