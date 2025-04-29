@@ -1,11 +1,10 @@
-
 import os
 import pickle
 import pandas as pd
 import numpy as np
 import xarray as xr
 from datetime import datetime
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 
 
 nwps = ['NWP_1','NWP_2','NWP_3']
@@ -42,7 +41,13 @@ def train(farm_id):
     y_df.columns = ['power']
     x_processed,y_processed = data_preprocess(x_df,y_df)
     y_processed[y_processed < 0] = 0
-    model = LinearRegression()
+    # 使用随机森林回归器替代线性回归
+    model = RandomForestRegressor(
+        n_estimators=100,  # 森林中树的数量
+        max_depth=None,    # 树的最大深度
+        min_samples_split=2,  # 分裂内部节点所需的最小样本数
+        random_state=42    # 随机数种子，确保结果可复现
+    )
     model.fit(x_processed,y_processed)
     return model
 
