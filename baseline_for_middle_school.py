@@ -44,7 +44,7 @@ def train(farm_id):
     # 使用随机森林回归器替代线性回归
     model = RandomForestRegressor(
         n_estimators=100,  # 森林中树的数量
-        max_depth=None,    # 树的最大深度
+        max_depth=5,    # 树的最大深度
         min_samples_split=2,  # 分裂内部节点所需的最小样本数
         random_state=42    # 随机数种子，确保结果可复现
     )
