@@ -1,93 +1,334 @@
 import os
 import pickle
-import pandas as pd
-import numpy as np
-import xarray as xr
+import warnings
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor
 
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import xarray as xr
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor, VotingRegressor
+from sklearn.feature_selection import SelectFromModel
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings('ignore')
 
 nwps = ['NWP_1','NWP_2','NWP_3']
 fact_path = 'training/middle_school/TRAIN/fact_data'
 
-def data_preprocess(x_df, y_df):
-    x_df = x_df.dropna()
-    y_df = y_df.dropna()
-    # 数据对扣
-    ind = [i for i in y_df.index if i in x_df.index]
-    x_df = x_df.loc[ind]
-    y_df = y_df.loc[ind]
-    return x_df,y_df
+def add_time_features(df):
+    """添加时间特征"""
+    df_copy = df.copy()
+    df_copy['hour'] = df_copy.index.hour
+    df_copy['day'] = df_copy.index.day
+    df_copy['month'] = df_copy.index.month
+    df_copy['dayofweek'] = df_copy.index.dayofweek
+    df_copy['sin_hour'] = np.sin(2 * np.pi * df_copy.index.hour / 24)
+    df_copy['cos_hour'] = np.cos(2 * np.pi * df_copy.index.hour / 24)
+    df_copy['sin_month'] = np.sin(2 * np.pi * df_copy.index.month / 12)
+    df_copy['cos_month'] = np.cos(2 * np.pi * df_copy.index.month / 12)
+    return df_copy
+
+def add_weather_derivatives(df):
+    """添加气象衍生特征"""
+    df_copy = df.copy()
+    
+    # 计算风速的一些统计特征
+    ws_cols = [col for col in df_copy.columns if '_ws_' in col]
+    if ws_cols:
+        df_copy['ws_mean'] = df_copy[ws_cols].mean(axis=1)
+        df_copy['ws_std'] = df_copy[ws_cols].std(axis=1)
+        df_copy['ws_min'] = df_copy[ws_cols].min(axis=1)
+        df_copy['ws_max'] = df_copy[ws_cols].max(axis=1)
+        df_copy['ws_range'] = df_copy['ws_max'] - df_copy['ws_min']
+        
+    # 计算风向特征
+    u_cols = [col for col in df_copy.columns if '_u_' in col]
+    v_cols = [col for col in df_copy.columns if '_v_' in col]
+    
+    if u_cols and v_cols:
+        # 计算平均风向
+        df_copy['mean_u'] = df_copy[u_cols].mean(axis=1)
+        df_copy['mean_v'] = df_copy[v_cols].mean(axis=1)
+        df_copy['wind_direction'] = np.arctan2(df_copy['mean_v'], df_copy['mean_u']) * 180 / np.pi
+        df_copy['wind_direction'] = df_copy['wind_direction'].apply(lambda x: x + 360 if x < 0 else x)
+        
+        # 添加风向的正弦和余弦分量以避免周期性问题
+        df_copy['sin_wind_dir'] = np.sin(np.radians(df_copy['wind_direction']))
+        df_copy['cos_wind_dir'] = np.cos(np.radians(df_copy['wind_direction']))
+    
+    # 计算一些交叉特征
+    for nwp in nwps:
+        ws_cols = [col for col in df_copy.columns if f'{nwp}_ws_' in col]
+        if ws_cols:
+            df_copy[f'{nwp}_ws_var'] = df_copy[ws_cols].var(axis=1)
+            df_copy[f'{nwp}_ws_kurt'] = df_copy[ws_cols].kurtosis(axis=1)
+    
+    return df_copy
+
+def add_lag_features(df, lag_hours=[1, 2, 3, 6, 12, 24]):
+    """添加滞后特征"""
+    df_copy = df.copy()
+    for col in df_copy.columns:
+        for lag in lag_hours:
+            df_copy[f'{col}_lag{lag}'] = df_copy[col].shift(lag)
+    return df_copy
+
+def data_preprocess(x_df, y_df=None, is_train=True):
+    """改进的数据预处理"""
+    x_df = x_df.copy()
+    
+    # 添加时间特征
+    x_df = add_time_features(x_df)
+    
+    # 添加气象衍生特征
+    x_df = add_weather_derivatives(x_df)
+    
+    if is_train and y_df is not None:
+        y_df = y_df.copy()
+        # 清理数据
+        x_df = x_df.dropna()
+        y_df = y_df.dropna()
+        
+        # 数据对扣
+        ind = [i for i in y_df.index if i in x_df.index]
+        x_df = x_df.loc[ind]
+        y_df = y_df.loc[ind]
+        
+        # 处理异常值
+        y_df[y_df < 0] = 0
+        y_df[y_df > 1] = 1
+        
+        return x_df, y_df
+    else:
+        # 测试数据处理
+        # 仅填充滞后特征的缺失值
+        lag_cols = [col for col in x_df.columns if 'lag' in col]
+        for col in lag_cols:
+            x_df[col].fillna(x_df[col].mean(), inplace=True)
+        return x_df
 
 def train(farm_id):
+    """增强版训练函数"""
+    print(f"开始训练发电站 {farm_id} 的模型...")
+    
+    # 读取和准备数据
     x_df = pd.DataFrame()
     nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
+    
+    # 处理NWP数据
     for nwp in nwps:
-        nwp_path = os.path.join(nwp_train_path,nwp,)
+        nwp_path = os.path.join(nwp_train_path, nwp)
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
-        u = nwp_data.sel(lat=range(4,7),lon=range(4,7),lead_time=range(24),
+        
+        # 提取更大范围的空间网格以捕获更多信息
+        u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                          channel=['u100']).data.values.reshape(365 * 24, 9)
-        v = nwp_data.sel(lat=range(4,7), lon=range(4,7),lead_time=range(24),
+        v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                      channel=['v100']).data.values.reshape(365 * 24, 9)
+        
+        # 创建基本特征
         u_df = pd.DataFrame(u, columns=[f"{nwp}_u_{i}" for i in range(u.shape[1])])
         v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
         ws = np.sqrt(u ** 2 + v ** 2)
         ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
-        nwp_df = pd.concat([u_df,v_df,ws_df],axis=1)
-        x_df = pd.concat([x_df,nwp_df],axis=1)
+        
+        # 添加风向角度特征
+        wd = np.arctan2(v, u) * 180 / np.pi
+        wd = np.where(wd < 0, wd + 360, wd)
+        wd_df = pd.DataFrame(wd, columns=[f"{nwp}_wd_{i}" for i in range(wd.shape[1])])
+        
+        nwp_df = pd.concat([u_df, v_df, ws_df, wd_df], axis=1)
+        x_df = pd.concat([x_df, nwp_df], axis=1)
+    
     x_df.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
-    y_df = pd.read_csv(os.path.join(fact_path,f'{farm_id}_normalization_train.csv'),index_col=0)
+    
+    # 读取目标变量
+    y_df = pd.read_csv(os.path.join(fact_path,f'{farm_id}_normalization_train.csv'), index_col=0)
     y_df.index = pd.to_datetime(y_df.index)
     y_df.columns = ['power']
-    x_processed,y_processed = data_preprocess(x_df,y_df)
-    y_processed[y_processed < 0] = 0
-    # 使用随机森林回归器替代线性回归
-    model = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=5,
-        min_samples_split=2,
+    
+    # 添加滞后特征
+    x_df = add_lag_features(x_df)
+    
+    # 预处理数据
+    x_processed, y_processed = data_preprocess(x_df, y_df, is_train=True)
+    
+    # 特征标准化
+    scaler = StandardScaler()
+    x_processed_scaled = pd.DataFrame(
+        scaler.fit_transform(x_processed), 
+        columns=x_processed.columns,
+        index=x_processed.index
+    )
+    
+    # 特征选择
+    selector = SelectFromModel(
+        RandomForestRegressor(n_estimators=100, random_state=42),
+        threshold='median'
+    )
+    selector.fit(x_processed_scaled, y_processed)
+    selected_features = x_processed_scaled.columns[selector.get_support()]
+    x_processed_selected = x_processed_scaled[selected_features]
+    
+    print(f"选择了 {len(selected_features)} 个特征，从总共 {x_processed_scaled.shape[1]} 个")
+    
+    # 创建多个模型
+    model_lgb = lgb.LGBMRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=6,
+        num_leaves=31,
+        subsample=0.8,
+        colsample_bytree=0.8,
         random_state=42
     )
-    model.fit(x_processed,y_processed)
-    return model
+    
+    model_xgb = xgb.XGBRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    
+    model_rf = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_split=5,
+        random_state=42
+    )
+    
+    # 创建集成模型
+    final_model = VotingRegressor([
+        ('lgb', model_lgb),
+        ('xgb', model_xgb),
+        ('rf', model_rf)
+    ])
+    
+    # 训练模型
+    final_model.fit(x_processed_selected, y_processed)
+    
+    # 评估模型
+    y_pred = final_model.predict(x_processed_selected)
+    train_rmse = np.sqrt(mean_squared_error(y_processed, y_pred))
+    train_r2 = r2_score(y_processed, y_pred)
+    
+    print(f"Farm {farm_id} 训练评估: RMSE = {train_rmse:.4f}, R² = {train_r2:.4f}")
+    
+    # 返回所有需要保存的组件
+    model_package = {
+        'model': final_model,
+        'scaler': scaler,
+        'feature_selector': selector,
+        'selected_features': selected_features
+    }
+    
+    return model_package
 
-def predict(model,farm_id):
+def predict(model_package, farm_id):
+    """增强版预测函数"""
+    # 解包模型组件
+    final_model = model_package['model']
+    scaler = model_package['scaler']
+    selector = model_package['feature_selector']
+    selected_features = model_package['selected_features']
+
+    # 读取测试数据
     x_df = pd.DataFrame()
     nwp_test_path = f'training/middle_school/TEST/nwp_data_test/{farm_id}'
+
+    # 处理NWP数据
     for nwp in nwps:
         nwp_path = os.path.join(nwp_test_path, nwp)
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
-        u = nwp_data.sel(lat=range(4,7),lon=range(4,7), lead_time=range(24),
+
+        # 提取相同的特征
+        u = nwp_data.sel(lat=range(4, 7), lon=range(4, 7), lead_time=range(24),
                          channel=['u100']).data.values.reshape(31 * 24, 9)
-        v = nwp_data.sel(lat=range(4,7), lon=range(4,7),lead_time=range(24),
-                     channel=['v100']).data.values.reshape(31 * 24, 9)
+        v = nwp_data.sel(lat=range(4, 7), lon=range(4, 7), lead_time=range(24),
+                         channel=['v100']).data.values.reshape(31 * 24, 9)
+
         u_df = pd.DataFrame(u, columns=[f"{nwp}_u_{i}" for i in range(u.shape[1])])
         v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
         ws = np.sqrt(u ** 2 + v ** 2)
         ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
-        nwp_df = pd.concat([u_df,v_df,ws_df],axis=1)
-        x_df = pd.concat([x_df,nwp_df],axis=1)
+
+        # 添加风向角度特征
+        wd = np.arctan2(v, u) * 180 / np.pi
+        wd = np.where(wd < 0, wd + 360, wd)
+        wd_df = pd.DataFrame(wd, columns=[f"{nwp}_wd_{i}" for i in range(wd.shape[1])])
+
+        nwp_df = pd.concat([u_df, v_df, ws_df, wd_df], axis=1)
+        x_df = pd.concat([x_df, nwp_df], axis=1)
+
     x_df.index = pd.date_range(datetime(1969, 1, 1, 0), datetime(1969, 1, 31, 23), freq='h')
-    pred_pw = model.predict(x_df).flatten()
-    pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0],periods=len(pred_pw), freq='h'))
-    res = pred.resample('15min').interpolate(method='linear')
-    res[res<0] = 0
-    res[res>1] = 1
+
+    # 添加滞后特征
+    x_df = add_lag_features(x_df)
+
+    # 预处理测试数据
+    x_test = add_time_features(x_df)
+    x_test = add_weather_derivatives(x_test)
+
+    # 填充缺失值
+    x_test = x_test.fillna(method='ffill').fillna(method='bfill')
+
+    # 应用标准化
+    x_test_scaled = pd.DataFrame(
+        scaler.transform(x_test),
+        columns=x_test.columns,
+        index=x_test.index
+    )
+
+    # 确保使用与训练完全相同的特征集和顺序
+    x_test_selected = pd.DataFrame(index=x_test_scaled.index)
+    for feature in selected_features:
+        if feature in x_test_scaled.columns:
+            x_test_selected[feature] = x_test_scaled[feature]
+        else:
+            # 如果缺少某特征，用0填充
+            x_test_selected[feature] = 0
+
+    # 预测
+    pred_pw = final_model.predict(x_test_selected).flatten()
+
+    # 创建预测序列
+    pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
+
+    # 将预测重采样为15分钟，并进行线性插值
+    res = pred.resample('15min').interpolate(method='cubic')
+
+    # 修正预测值范围
+    res[res < 0] = 0
+    res[res > 1] = 1
+
     return res
 
+# 主程序
 acc = pd.DataFrame()
 farms = [1,2,3,4,5,6,7,8,9,10]
+
 for farm_id in farms:
+    print(f"\n开始处理发电站 {farm_id}...")
     model_path = f'models/{farm_id}'
-    os.makedirs(model_path,exist_ok=True)
-    model_name = 'baseline_middle_school.pkl'
-    model = train(farm_id)
-    with open(
-            os.path.join(model_path, model_name),
-            "wb") as f:
-        pickle.dump(model, f)
-    pred = predict(model,farm_id)
+    os.makedirs(model_path, exist_ok=True)
+    model_name = 'advanced_model.pkl'
+    
+    # 训练和保存模型
+    model_package = train(farm_id)
+    with open(os.path.join(model_path, model_name), "wb") as f:
+        pickle.dump(model_package, f)
+    
+    # 生成预测
+    pred = predict(model_package, farm_id)
+    
+    # 保存预测结果
     result_path = f'result/output'
-    os.makedirs(result_path,exist_ok=True)
-    pred.to_csv(os.path.join(result_path,f'output{farm_id}.csv'))
-print('ok')
+    os.makedirs(result_path, exist_ok=True)
+    pred.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
+    
+print('所有发电站处理完成')
