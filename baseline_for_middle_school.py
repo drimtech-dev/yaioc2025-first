@@ -11,9 +11,16 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, V
 from sklearn.feature_selection import SelectFromModel
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.model_selection import TimeSeriesSplit
 from scipy.interpolate import CubicSpline
+
+# 导入PyTorch相关库
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.optim import Adam
+import torch.nn.functional as F
 
 # 定义风电场和光伏场站ID
 WIND_FARMS = [1, 2, 3, 4, 5]
@@ -23,6 +30,17 @@ warnings.filterwarnings('ignore')
 
 nwps = ['NWP_1','NWP_2','NWP_3']
 fact_path = 'training/middle_school/TRAIN/fact_data'
+
+# 设置随机种子，确保结果可重现
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+
+# 检查是否可用CUDA
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
 
 def add_time_features(df):
     """添加时间特征"""
@@ -154,8 +172,189 @@ def add_lag_features(df, lag_hours=[1, 2, 3, 6, 12, 24]):
             df_copy[f'{col}_lag{lag}'] = df_copy[col].shift(lag)
     return df_copy
 
-def data_preprocess(x_df, y_df=None, is_train=True):
-    """改进的数据预处理"""
+# PyTorch模型定义
+class LSTMModel(nn.Module):
+    """
+    基于LSTM的深度学习模型
+    """
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.3, output_dim=1):
+        super(LSTMModel, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # 双向LSTM层
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=True
+        )
+        
+        # 全连接层
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim // 2)  # *2是因为双向LSTM
+        self.dropout1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
+    
+    def forward(self, x):
+        # LSTM层的输出
+        lstm_out, _ = self.lstm(x)
+        
+        # 只取最后一个时间步的输出
+        lstm_out = lstm_out[:, -1, :]
+        
+        # 全连接层
+        out = F.relu(self.fc1(lstm_out))
+        out = self.dropout1(out)
+        out = self.fc2(out)
+        
+        return out
+
+class CNNLSTMModel(nn.Module):
+    """
+    CNN+LSTM混合模型，CNN用于提取空间特征，LSTM用于时序特征
+    """
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1, dropout=0.3, output_dim=1):
+        super(CNNLSTMModel, self).__init__()
+        
+        # CNN层
+        self.conv1 = nn.Conv1d(input_dim, 64, kernel_size=3, padding=1)
+        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # 计算CNN输出后的序列长度
+        self.lstm_input_dim = 128
+        self.lstm_seq_len = input_dim // 4  # 因为有两次池化层，每次长度减半
+        
+        # LSTM层
+        self.lstm = nn.LSTM(
+            input_size=self.lstm_input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=False
+        )
+        
+        # 全连接层
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.dropout3 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
+    
+    def forward(self, x):
+        # 调整输入维度顺序以适配CNN (batch, seq_len, features) -> (batch, features, seq_len)
+        x = x.permute(0, 2, 1)
+        
+        # CNN层
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        x = self.dropout1(x)
+        
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        x = self.dropout2(x)
+        
+        # 调整维度以适配LSTM (batch, features, seq_len) -> (batch, seq_len, features)
+        x = x.permute(0, 2, 1)
+        
+        # LSTM层
+        lstm_out, _ = self.lstm(x)
+        
+        # 只取最后一个时间步
+        lstm_out = lstm_out[:, -1, :]
+        
+        # 全连接层
+        out = F.relu(self.fc1(lstm_out))
+        out = self.dropout3(out)
+        out = self.fc2(out)
+        
+        return out
+
+def create_sequences(data, target=None, seq_length=24):
+    """
+    创建用于时间序列深度学习模型的序列数据
+    """
+    X = []
+    y = []
+    
+    for i in range(seq_length, len(data)):
+        X.append(data.iloc[i-seq_length:i].values)
+        if target is not None:
+            y.append(target.iloc[i])
+    
+    if target is not None:
+        return np.array(X), np.array(y)
+    else:
+        return np.array(X)
+
+def train_pytorch_model(model, train_loader, val_loader, num_epochs=100, patience=10):
+    """训练PyTorch模型并进行早停"""
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = Adam(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=0.0001
+    )
+    
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+    
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * X_batch.size(0)
+        
+        train_loss /= len(train_loader.dataset)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item() * X_batch.size(0)
+        
+        val_loss /= len(val_loader.dataset)
+        scheduler.step(val_loss)
+        
+        print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # 早停检查
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print('Early stopping!')
+                break
+    
+    # 恢复最佳模型状态
+    model.load_state_dict(best_model_state)
+    return model, best_val_loss
+
+def data_preprocess(x_df, y_df=None, is_train=True, is_dl_model=False, seq_length=24):
+    """改进的数据预处理，支持深度学习模型的数据准备"""
     x_df = x_df.copy()
     
     # 添加时间特征
@@ -179,17 +378,33 @@ def data_preprocess(x_df, y_df=None, is_train=True):
         y_df[y_df < 0] = 0
         y_df[y_df > 1] = 1
         
-        return x_df, y_df
+        # 为深度学习模型创建序列数据
+        if is_dl_model:
+            # 确保索引连续并按时间排序
+            x_df = x_df.sort_index()
+            y_df = y_df.sort_index()
+            
+            # 创建序列数据
+            X_seq, y_seq = create_sequences(x_df, y_df, seq_length=seq_length)
+            return X_seq, y_seq
+        else:
+            return x_df, y_df
     else:
         # 测试数据处理
         # 仅填充滞后特征的缺失值
         lag_cols = [col for col in x_df.columns if 'lag' in col]
         for col in lag_cols:
             x_df[col].fillna(x_df[col].mean(), inplace=True)
-        return x_df
+            
+        if is_dl_model:
+            # 创建序列数据，不需要目标变量
+            X_seq = create_sequences(x_df, seq_length=seq_length)
+            return X_seq
+        else:
+            return x_df
 
 def train(farm_id):
-    """增强版训练函数"""
+    """增强版训练函数，包含PyTorch深度学习模型"""
     print(f"开始训练发电站 {farm_id} 的模型...")
     
     # 读取和准备数据
@@ -244,7 +459,7 @@ def train(farm_id):
     
     # 特征选择
     selector = SelectFromModel(
-        RandomForestRegressor(n_estimators=100, random_state=42),
+        RandomForestRegressor(n_estimators=100, random_state=RANDOM_SEED),
         threshold='median'
     )
     selector.fit(x_processed_scaled, y_processed)
@@ -253,14 +468,14 @@ def train(farm_id):
     
     print(f"选择了 {len(selected_features)} 个特征，从总共 {x_processed_scaled.shape[1]} 个")
     
-    # 创建模型
+    # 创建树模型
     model_lgb = lgb.LGBMRegressor(
         n_estimators=200,
         learning_rate=0.05,
         num_leaves=31,
         subsample=0.8,
         colsample_bytree=0.8,
-        random_state=42
+        random_state=RANDOM_SEED
     )
     model_xgb = xgb.XGBRegressor(
         n_estimators=200,
@@ -268,52 +483,133 @@ def train(farm_id):
         max_depth=10,
         subsample=0.8,
         colsample_bytree=0.8,
-        random_state=42
+        random_state=RANDOM_SEED
     )
     model_rf = RandomForestRegressor(
         n_estimators=100,
         max_depth=10,
         min_samples_split=5,
-        random_state=42
+        random_state=RANDOM_SEED
     )
     
-    # 集成模型
-    final_model = VotingRegressor(
-        estimators=[
-            ('lgb', model_lgb),
-            ('xgb', model_xgb),
-            ('rf', model_rf)
-        ],
-        weights=[0.4, 0.4, 0.2]
+    # 训练树模型
+    model_lgb.fit(x_processed_selected, y_processed)
+    model_xgb.fit(x_processed_selected, y_processed)
+    model_rf.fit(x_processed_selected, y_processed)
+    
+    # 预处理深度学习模型的数据
+    seq_length = 24  # 使用24小时的历史数据
+    X_seq, y_seq = data_preprocess(x_df, y_df, is_train=True, is_dl_model=True, seq_length=seq_length)
+    
+    # 特征缩放
+    X_seq_scaled = np.zeros_like(X_seq)
+    for i in range(X_seq.shape[0]):
+        X_seq_scaled[i] = scaler.transform(X_seq[i])
+    
+    # 转换为PyTorch张量
+    X_tensor = torch.FloatTensor(X_seq_scaled)
+    y_tensor = torch.FloatTensor(y_seq.reshape(-1, 1))
+    
+    # 创建数据集和数据加载器
+    dataset = TensorDataset(X_tensor, y_tensor)
+    
+    # 划分训练集和验证集
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32)
+    
+    # 创建深度学习模型
+    input_dim = X_seq_scaled.shape[2]  # 特征维度
+    
+    # 训练LSTM模型
+    print("训练LSTM模型...")
+    lstm_model = LSTMModel(input_dim=input_dim)
+    lstm_model, lstm_val_loss = train_pytorch_model(
+        lstm_model, train_loader, val_loader, num_epochs=100, patience=10
     )
     
-    # 训练模型
-    final_model.fit(x_processed_selected, y_processed)
+    # 训练CNN-LSTM模型
+    print("训练CNN-LSTM模型...")
+    cnn_lstm_model = CNNLSTMModel(input_dim=input_dim)
+    cnn_lstm_model, cnn_lstm_val_loss = train_pytorch_model(
+        cnn_lstm_model, train_loader, val_loader, num_epochs=100, patience=10
+    )
     
-    # 评估模型
-    y_pred = final_model.predict(x_processed_selected)
-    train_rmse = np.sqrt(mean_squared_error(y_processed, y_pred))
-    train_r2 = r2_score(y_processed, y_pred)
+    # 评估各个模型
+    # 树模型评估
+    lgb_pred = model_lgb.predict(x_processed_selected)
+    xgb_pred = model_xgb.predict(x_processed_selected)
+    rf_pred = model_rf.predict(x_processed_selected)
     
-    print(f"发电站 {farm_id} 训练评估: RMSE = {train_rmse:.4f}, R² = {train_r2:.4f}")
+    # 深度学习模型评估
+    lstm_model.eval()
+    cnn_lstm_model.eval()
+    
+    with torch.no_grad():
+        lstm_pred = lstm_model(X_tensor).cpu().numpy().flatten()
+        cnn_lstm_pred = cnn_lstm_model(X_tensor).cpu().numpy().flatten()
+    
+    # 集成预测
+    tree_preds = np.column_stack([lgb_pred, xgb_pred, rf_pred])
+    tree_weights = np.array([0.35, 0.35, 0.3])
+    tree_ensemble_pred = np.sum(tree_preds * tree_weights.reshape(1, -1), axis=1)
+    
+    # 计算各模型的RMSE
+    tree_rmse = np.sqrt(mean_squared_error(y_processed, tree_ensemble_pred))
+    lstm_rmse = np.sqrt(mean_squared_error(y_seq, lstm_pred))
+    cnn_lstm_rmse = np.sqrt(mean_squared_error(y_seq, cnn_lstm_pred))
+    
+    print(f"树模型集成RMSE: {tree_rmse:.4f}")
+    print(f"LSTM模型RMSE: {lstm_rmse:.4f}")
+    print(f"CNN-LSTM模型RMSE: {cnn_lstm_rmse:.4f}")
+    
+    # 确定最终权重（基于RMSE的倒数）
+    total_inv_rmse = 1/tree_rmse + 1/lstm_rmse + 1/cnn_lstm_rmse
+    tree_weight = (1/tree_rmse) / total_inv_rmse
+    lstm_weight = (1/lstm_rmse) / total_inv_rmse
+    cnn_lstm_weight = (1/cnn_lstm_rmse) / total_inv_rmse
+    
+    print(f"最终集成权重 - 树模型: {tree_weight:.2f}, LSTM: {lstm_weight:.2f}, CNN-LSTM: {cnn_lstm_weight:.2f}")
     
     # 返回所有需要保存的组件
     model_package = {
-        'model': final_model,
+        'tree_models': {
+            'lgb': model_lgb,
+            'xgb': model_xgb,
+            'rf': model_rf,
+            'tree_weights': tree_weights
+        },
+        'dl_models': {
+            'lstm': lstm_model,
+            'cnn_lstm': cnn_lstm_model
+        },
+        'ensemble_weights': {
+            'tree': tree_weight,
+            'lstm': lstm_weight,
+            'cnn_lstm': cnn_lstm_weight
+        },
         'scaler': scaler,
         'feature_selector': selector,
-        'selected_features': selected_features
+        'selected_features': selected_features,
+        'seq_length': seq_length,
+        'accuracy': 1 - (tree_rmse + lstm_rmse + cnn_lstm_rmse) / 3  # 简单的准确率估计
     }
     
     return model_package
 
 def predict(model_package, farm_id):
-    """增强版预测函数"""
+    """增强版预测函数，集成树模型和PyTorch深度学习模型"""
     # 解包模型组件
-    final_model = model_package['model']
+    tree_models = model_package['tree_models']
+    dl_models = model_package['dl_models']
+    ensemble_weights = model_package['ensemble_weights']
     scaler = model_package['scaler']
     selector = model_package['feature_selector']
     selected_features = model_package['selected_features']
+    seq_length = model_package['seq_length']
     
     # 读取测试数据
     x_df = pd.DataFrame()
@@ -347,113 +643,14 @@ def predict(model_package, farm_id):
     # 添加滞后特征
     x_df = add_lag_features(x_df)
     
-    # 预处理测试数据
+    # 树模型预测准备
     x_test = data_preprocess(x_df, is_train=False)
-    
-    # 应用标准化
     x_test_scaled = pd.DataFrame(
         scaler.transform(x_test),
         columns=x_test.columns,
         index=x_test.index
     )
     
-    # 确保使用与训练完全相同的特征集和顺序
-    x_test_selected = pd.DataFrame(index=x_test_scaled.index)
-    for feature in selected_features:
-        if feature in x_test_scaled.columns:
-            x_test_selected[feature] = x_test_scaled[feature]
-        else:
-            x_test_selected[feature] = 0
-    
-    # 预测
-    pred_pw = final_model.predict(x_test_selected).flatten()
-    
-    # 创建预测序列
-    pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
-    
-    # 将预测重采样为15分钟
-    res = pred.resample('15min').interpolate(method='cubic')
-    
-    # 修正预测值范围
-    res[res < 0] = 0
-    res[res > 1] = 1
-    
-    return res
-
-def main():
-    """主程序执行函数，处理所有场站的训练与预测"""
-    print("===== 新能源功率预报系统启动 =====")
-    print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 创建必要的目录
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('result/output', exist_ok=True)
-    
-    # 处理所有场站
-    farms = WIND_FARMS + SOLAR_FARMS
-    print(f"将处理 {len(farms)} 个发电站: {farms}")
-    
-    # 存储准确率信息
-    accuracies = {}
-    
-    # 循环处理每个场站
-    for farm_id in farms:
-        try:
-            print(f"\n===== 开始处理发电站 {farm_id} =====")
-            model_path = f'models/{farm_id}'
-            os.makedirs(model_path, exist_ok=True)
-            model_file = os.path.join(model_path, 'enhanced_model.pkl')
-            
-            # 判断是否已有训练好的模型
-            if os.path.exists(model_file) and os.path.getsize(model_file) > 0:
-                print(f"发现已有训练模型，加载模型: {model_file}")
-                with open(model_file, "rb") as f:
-                    model_package = pickle.load(f)
-            else:
-                print(f"未发现已有模型，开始训练新模型")
-                # 训练模型
-                model_package = train(farm_id)
-                # 保存模型
-                with open(model_file, "wb") as f:
-                    pickle.dump(model_package, f)
-                print(f"模型已保存至: {model_file}")
-            
-            # 生成预测
-            print(f"开始生成发电站 {farm_id} 的预测结果...")
-            pred = predict(model_package, farm_id)
-            
-            # 记录模型精度
-            if 'accuracy' in model_package:
-                accuracies[farm_id] = model_package['accuracy']
-            
-            # 保存预测结果
-            result_file = os.path.join('result/output', f'output{farm_id}.csv')
-            pred.to_csv(result_file)
-            print(f"预测结果已保存至: {result_file}")
-            print(f"发电站 {farm_id} 处理完成")
-            
-        except Exception as e:
-            print(f"处理发电站 {farm_id} 时发生错误: {e}")
-            import traceback
-            print(traceback.format_exc())
-    
-    # 输出整体模型准确率信息
-    if accuracies:
-        avg_accuracy = sum(accuracies.values()) / len(accuracies)
-        print(f"\n===== 模型准确率总结 =====")
-        for farm_id, acc in accuracies.items():
-            print(f"发电站 {farm_id}: {acc:.4f}")
-        print(f"平均准确率: {avg_accuracy:.4f}")
-    
-    # 打包所有输出结果
-    try:
-        import zipfile
-        output_files = [f'output{i}.csv' for i in farms]
-        with zipfile.ZipFile('result/output.zip', 'w') as zipf:
-            for file in output_files:
-                file_path = os.path.join('result/output', file)
-                if os.path.exists(file_path):
-                    zipf.write(file_path, arcname=file)
         print(f"所有预测结果已打包至: result/output.zip")
     except Exception as e:
         print(f"打包输出结果时发生错误: {e}")
