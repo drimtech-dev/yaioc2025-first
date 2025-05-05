@@ -688,6 +688,10 @@ def predict(model_package, farm_id):
 
 def main():
     """主函数，训练和预测所有风电场和光伏场站"""
+    # 确保存储模型和结果的目录存在
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('result', exist_ok=True)
+    
     model_packages = {}
     
     # 训练所有风电场和光伏场站的模型
