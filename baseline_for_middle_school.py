@@ -549,8 +549,9 @@ def train(farm_id):
     cnn_lstm_model.eval()
     
     with torch.no_grad():
-        lstm_pred = lstm_model(X_tensor).cpu().numpy().flatten()
-        cnn_lstm_pred = cnn_lstm_model(X_tensor).cpu().numpy().flatten()
+        X_tensor_gpu = X_tensor.to(device)  # 将输入数据移到GPU
+        lstm_pred = lstm_model(X_tensor_gpu).cpu().numpy().flatten()
+        cnn_lstm_pred = cnn_lstm_model(X_tensor_gpu).cpu().numpy().flatten()
     
     # 集成预测
     tree_preds = np.column_stack([lgb_pred, xgb_pred, rf_pred])
@@ -607,7 +608,7 @@ def predict(model_package, farm_id):
     dl_models = model_package['dl_models']
     ensemble_weights = model_package['ensemble_weights']
     scaler = model_package['scaler']
-    selector = model_package['feature_selector']
+    selector = model_package['selector']
     selected_features = model_package['selected_features']
     seq_length = model_package['seq_length']
     
@@ -651,6 +652,74 @@ def predict(model_package, farm_id):
         index=x_test.index
     )
     
+    x_test_selected = x_test_scaled[selected_features]
+    
+    # 树模型预测
+    lgb_pred = tree_models['lgb'].predict(x_test_selected)
+    xgb_pred = tree_models['xgb'].predict(x_test_selected)
+    rf_pred = tree_models['rf'].predict(x_test_selected)
+    
+    tree_preds = np.column_stack([lgb_pred, xgb_pred, rf_pred])
+    tree_ensemble_pred = np.sum(tree_preds * tree_models['tree_weights'].reshape(1, -1), axis=1)
+    
+    # 深度学习模型预测准备
+    X_seq_test = data_preprocess(x_df, is_train=False, is_dl_model=True, seq_length=seq_length)
+    
+    X_seq_test_scaled = np.zeros_like(X_seq_test)
+    for i in range(X_seq_test.shape[0]):
+        X_seq_test_scaled[i] = scaler.transform(X_seq_test[i])
+    
+    X_tensor_test = torch.FloatTensor(X_seq_test_scaled).to(device)
+    
+    # 深度学习模型预测
+    dl_models['lstm'].eval()
+    dl_models['cnn_lstm'].eval()
+    
+    with torch.no_grad():
+        lstm_pred = dl_models['lstm'](X_tensor_test).cpu().numpy().flatten()
+        cnn_lstm_pred = dl_models['cnn_lstm'](X_tensor_test).cpu().numpy().flatten()
+    
+    # 集成预测
+    final_pred = (tree_ensemble_pred * ensemble_weights['tree'] +
+                  lstm_pred * ensemble_weights['lstm'] +
+                  cnn_lstm_pred * ensemble_weights['cnn_lstm'])
+    
+    return final_pred
+
+def main():
+    """主函数，训练和预测所有风电场和光伏场站"""
+    model_packages = {}
+    
+    # 训练所有风电场和光伏场站的模型
+    for farm_id in WIND_FARMS + SOLAR_FARMS:
+        model_package = train(farm_id)
+        model_packages[farm_id] = model_package
+        
+        # 保存模型包
+        with open(f'models/model_package_{farm_id}.pkl', 'wb') as f:
+            pickle.dump(model_package, f)
+    
+    # 预测所有风电场和光伏场站的功率
+    predictions = {}
+    for farm_id in WIND_FARMS + SOLAR_FARMS:
+        with open(f'models/model_package_{farm_id}.pkl', 'rb') as f:
+            model_package = pickle.load(f)
+        
+        pred = predict(model_package, farm_id)
+        predictions[farm_id] = pred
+        
+        # 保存预测结果
+        pred_df = pd.DataFrame(pred, columns=['predicted_power'])
+        pred_df.index = pd.date_range(datetime(1969, 1, 1, 0), datetime(1969, 1, 31, 23), freq='h')
+        pred_df.to_csv(f'result/prediction_{farm_id}.csv')
+    
+    # 打包所有预测结果
+    try:
+        import zipfile
+        with zipfile.ZipFile('result/output.zip', 'w') as zipf:
+            for farm_id in WIND_FARMS + SOLAR_FARMS:
+                zipf.write(f'result/prediction_{farm_id}.csv')
+        
         print(f"所有预测结果已打包至: result/output.zip")
     except Exception as e:
         print(f"打包输出结果时发生错误: {e}")
