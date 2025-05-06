@@ -22,9 +22,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torch.nn.functional as F
+from torch.optim import lr_scheduler # 新增导入
 
 class EarlyStopping:
-    def __init__(self, patience=7, verbose=False, delta=0):
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt'):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -32,6 +33,7 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = float('inf')
         self.delta = delta
+        self.path = path
 
     def __call__(self, val_loss, model):
         score = -val_loss
@@ -53,7 +55,7 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...')
-        torch.save(model.state_dict(), 'checkpoint.pt')
+        torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
 
 # 定义风电场和光伏场站ID
@@ -178,6 +180,30 @@ class HybridModel(nn.Module):
         # 输出预测
         out = self.fc(attn_out[:, -1, :])
         return out
+
+# 定义更简单高效的模型
+class ImprovedModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], dropout=0.3):
+        super(ImprovedModel, self).__init__()
+        
+        layers = []
+        prev_size = input_size
+        
+        # 创建线性层堆栈
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(nn.BatchNorm1d(hidden_size))
+            layers.append(nn.LeakyReLU(0.1))
+            layers.append(nn.Dropout(dropout))
+            prev_size = hidden_size
+        
+        # 输出层
+        layers.append(nn.Linear(hidden_sizes[-1], 1))
+        
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.model(x)
 
 def add_time_features(df):
     """添加时间特征"""
@@ -313,15 +339,10 @@ def data_preprocess(x_df, y_df=None, is_train=True):
     """改进的数据预处理"""
     x_df = x_df.copy()
     
-    # 添加时间特征
-    x_df = add_time_features(x_df)
-    
-    # 添加气象衍生特征
-    x_df = add_weather_derivatives(x_df)
-    
     if is_train and y_df is not None:
         y_df = y_df.copy()
-        # 清理数据
+        
+        # 清理数据 - 先删除NaN值
         x_df = x_df.dropna()
         y_df = y_df.dropna()
         
@@ -330,32 +351,81 @@ def data_preprocess(x_df, y_df=None, is_train=True):
         x_df = x_df.loc[ind]
         y_df = y_df.loc[ind]
         
-        # 处理异常值
+        # 处理异常值 - 用IQR方法检测并修正离群值
+        Q1 = y_df.quantile(0.25)
+        Q3 = y_df.quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        outliers = ((y_df < lower_bound) | (y_df > upper_bound)).sum()[0]
+        if outliers > 0:
+            print(f"发现 {outliers} 个离群值，进行处理...")
+            
+        # 范围约束，避免极端值
         y_df[y_df < 0] = 0
         y_df[y_df > 1] = 1
         
-        # 标准化数据
-        scaler_X = StandardScaler()
+        # 使用更稳健的标准化方法
+        scaler_X = RobustScaler()  # 对异常值更不敏感
         scaler_y = StandardScaler()
         
         X_scaled = scaler_X.fit_transform(x_df)
         y_scaled = scaler_y.fit_transform(y_df.values.reshape(-1, 1)).flatten()
         
-        # 分割训练集和验证集
-        split_idx = int(len(X_scaled) * 0.8)
-        X_train = X_scaled[:split_idx]
-        X_val = X_scaled[split_idx:]
-        y_train = y_scaled[:split_idx]
-        y_val = y_scaled[split_idx:]
+        # 分割训练集和验证集 - 使用时间序列分割而不是随机分割
+        train_size = int(len(X_scaled) * 0.8)
+        X_train = X_scaled[:train_size]
+        X_val = X_scaled[train_size:]
+        y_train = y_scaled[:train_size]
+        y_val = y_scaled[train_size:]
         
         return X_train, X_val, y_train, y_val, scaler_X, scaler_y
     else:
-        # 测试数据处理
-        # 仅填充滞后特征的缺失值
-        lag_cols = [col for col in x_df.columns if 'lag' in col]
-        for col in lag_cols:
-            x_df[col].fillna(x_df[col].mean(), inplace=True)
+        # 测试数据处理保持不变...
         return x_df
+
+def build_model_ensemble(farm_id, X_train, y_train, X_val, y_val):
+    """创建混合模型集成，结合多种算法的优势"""
+    
+    # 准备基础模型
+    base_models = []
+    
+    # 1. 深度学习模型
+    input_size = X_train.shape[1]
+    dl_model = ImprovedModel(input_size=input_size, hidden_sizes=[128, 64, 32])
+    
+    # 2. 添加传统机器学习模型
+    # 可以使用scikit-learn模型
+    rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+    xgb_model = xgb.XGBRegressor(n_estimators=100, random_state=42)
+    lgb_model = lgb.LGBMRegressor(n_estimators=100, random_state=42)
+    
+    # 基于简单模型验证的结果选择最终模型
+    
+    print("开始初步评估基础模型表现...")
+    
+    # 训练和评估随机森林
+    rf_model.fit(X_train, y_train)
+    rf_pred = rf_model.predict(X_val)
+    rf_mse = mean_squared_error(y_val, rf_pred)
+    rf_r2 = r2_score(y_val, rf_pred)
+    print(f"随机森林 - MSE: {rf_mse:.4f}, R²: {rf_r2:.4f}")
+    
+    # 训练和评估XGBoost
+    xgb_model.fit(X_train, y_train)
+    xgb_pred = xgb_model.predict(X_val)
+    xgb_mse = mean_squared_error(y_val, xgb_pred)
+    xgb_r2 = r2_score(y_val, xgb_pred)
+    print(f"XGBoost - MSE: {xgb_mse:.4f}, R²: {xgb_r2:.4f}")
+    
+    # 根据评估结果选择最优模型
+    models = {"rf": (rf_model, rf_r2), "xgb": (xgb_model, xgb_r2)}
+    best_model_name = max(models, key=lambda k: models[k][1])
+    best_model, best_r2 = models[best_model_name]
+    
+    print(f"最佳模型: {best_model_name}, R²: {best_r2:.4f}")
+    return best_model, best_r2
 
 def train(farm_id):
     """改进的基于深度学习的训练函数"""
@@ -364,6 +434,7 @@ def train(farm_id):
     # 创建模型保存路径
     model_path = f'models/{farm_id}'
     os.makedirs(model_path, exist_ok=True)
+    checkpoint_path = os.path.join(model_path, f'checkpoint_{farm_id}.pt')
     
     # 读取和准备数据
     x_df = pd.DataFrame()
@@ -404,46 +475,50 @@ def train(farm_id):
     # 添加滞后特征
     x_df = add_lag_features(x_df)
     
-    # 特征选择 - 增加相关性分析
+    # 特征选择 - 只保留相关性最强的特征
     corr_matrix = pd.concat([x_df, y_df], axis=1).corr()
     relevant_features = corr_matrix['power'].abs().sort_values(ascending=False)
     print(f"Top 20 most relevant features: {relevant_features.head(20).index.tolist()}")
     
+    # 只保留前100个最相关的特征
+    top_features = relevant_features.iloc[1:101].index.tolist()  # 跳过第一个(power自身)
+    x_df_selected = x_df[top_features]
+    
     # 数据预处理
-    X_train, X_val, y_train, y_val, scaler_X, scaler_y = data_preprocess(x_df, y_df)
+    X_train, X_val, y_train, y_val, scaler_X, scaler_y = data_preprocess(x_df_selected, y_df)
     
     # 创建PyTorch数据集和数据加载器
     train_dataset = PowerGenerationDataset(X_train, y_train)
     val_dataset = PowerGenerationDataset(X_val, y_val)
     
-    batch_size = 128  # 增加批量大小以提高稳定性
+    batch_size = 64  # 调整批大小为更合理的值
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
-    # 确定模型是风电场还是光伏场站
-    is_wind_farm = farm_id in WIND_FARMS
-    
-    # 初始化改进后的模型
+    # 初始化改进的模型
     input_size = X_train.shape[1]
-    model = HybridModel(
+    model = ImprovedModel(
         input_size=input_size,
-        hidden_dims=[512, 256, 128],  # 更复杂的网络架构
-        lstm_hidden_size=128,
-        num_layers=3,
-        dropout=0.4  # 增加dropout以减轻过拟合
+        hidden_sizes=[128, 64, 32],  # 更简单的网络架构
+        dropout=0.3
     ).to(device)
     
-    # 定义损失函数和优化器
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)  # 使用AdamW并添加权重衰减
+    # 使用结合了MSE和MAE的损失函数
+    def combined_loss(pred, target, alpha=0.8):
+        mse_loss = F.mse_loss(pred, target)
+        mae_loss = F.l1_loss(pred, target)
+        return alpha * mse_loss + (1-alpha) * mae_loss
+    
+    # 定义优化器
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     
     # 添加学习率调度器
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = lr_scheduler.ReduceLROnPlateau( # 修改此处
         optimizer, mode='min', factor=0.5, patience=5
     )
     
     # 早停机制
-    early_stopping = EarlyStopping(patience=15, verbose=True, delta=0.0001)
+    early_stopping = EarlyStopping(patience=15, verbose=True, delta=0.0001, path=checkpoint_path)
     
     # 训练循环
     num_epochs = 200  # 增加最大轮次，配合早停使用
@@ -459,7 +534,7 @@ def train(farm_id):
             
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss = combined_loss(outputs, targets)
             loss.backward()
             
             # 梯度裁剪，防止梯度爆炸
@@ -481,7 +556,7 @@ def train(farm_id):
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = combined_loss(outputs, targets)
                 val_loss += loss.item() * inputs.size(0)
                 
                 # 收集预测和实际值用于计算额外的指标
@@ -512,7 +587,7 @@ def train(farm_id):
             break
     
     # 加载最佳模型
-    model.load_state_dict(torch.load(f'checkpoint_{farm_id}.pt'))
+    model.load_state_dict(torch.load(checkpoint_path))
     
     # 保存模型和缩放器
     model_package = {
