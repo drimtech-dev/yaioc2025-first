@@ -15,6 +15,13 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
 from scipy.interpolate import CubicSpline
 
+# 添加PyTorch相关依赖
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+import torch.nn.functional as F
+
 # 定义风电场和光伏场站ID
 WIND_FARMS = [1, 2, 3, 4, 5]
 SOLAR_FARMS = [6, 7, 8, 9, 10]
@@ -23,6 +30,105 @@ warnings.filterwarnings('ignore')
 
 nwps = ['NWP_1','NWP_2','NWP_3']
 fact_path = 'training/middle_school/TRAIN/fact_data'
+
+# 检查是否有GPU可用
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# 设置随机种子以确保结果可复现
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# 创建自定义Dataset
+class PowerGenerationDataset(Dataset):
+    def __init__(self, features, targets=None):
+        self.features = torch.tensor(features.values, dtype=torch.float32)
+        if targets is not None:
+            self.targets = torch.tensor(targets.values, dtype=torch.float32)
+            self.has_targets = True
+        else:
+            self.has_targets = False
+            
+    def __len__(self):
+        return len(self.features)
+    
+    def __getitem__(self, idx):
+        if self.has_targets:
+            return self.features[idx], self.targets[idx]
+        else:
+            return self.features[idx]
+
+# 定义LSTM模型
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.3):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x):
+        # 调整输入形状为 [batch_size, seq_len=1, input_size]
+        x = x.unsqueeze(1)
+        lstm_out, _ = self.lstm(x)
+        output = self.fc(lstm_out.squeeze(1))
+        return output
+
+# 定义混合模型 (MLP + LSTM)
+class HybridModel(nn.Module):
+    def __init__(self, input_size, hidden_dims=[256, 128], lstm_hidden_size=64, num_layers=2, dropout=0.3):
+        super(HybridModel, self).__init__()
+        
+        # MLP部分
+        mlp_layers = []
+        prev_dim = input_size
+        for hidden_dim in hidden_dims:
+            mlp_layers.append(nn.Linear(prev_dim, hidden_dim))
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.BatchNorm1d(hidden_dim))
+            mlp_layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+            
+        self.mlp = nn.Sequential(*mlp_layers)
+        
+        # LSTM部分
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=lstm_hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # 合并层
+        self.fc1 = nn.Linear(hidden_dims[-1] + lstm_hidden_size, 64)
+        self.fc2 = nn.Linear(64, 1)
+        
+    def forward(self, x):
+        # MLP路径
+        mlp_out = self.mlp(x)
+        
+        # LSTM路径
+        lstm_in = x.unsqueeze(1)  # 添加序列维度
+        lstm_out, _ = self.lstm(lstm_in)
+        lstm_out = lstm_out.squeeze(1)  # 移除序列维度
+        
+        # 合并MLP和LSTM输出
+        combined = torch.cat([mlp_out, lstm_out], dim=1)
+        x = F.relu(self.fc1(combined))
+        output = self.fc2(x)
+        
+        return output.squeeze(-1)  # 确保输出维度是 [batch_size]
 
 def add_time_features(df):
     """添加时间特征"""
@@ -189,8 +295,8 @@ def data_preprocess(x_df, y_df=None, is_train=True):
         return x_df
 
 def train(farm_id):
-    """增强版训练函数"""
-    print(f"开始训练发电站 {farm_id} 的模型...")
+    """基于深度学习的训练函数"""
+    print(f"开始训练发电站 {farm_id} 的深度学习模型...")
     
     # 读取和准备数据
     x_df = pd.DataFrame()
@@ -242,78 +348,173 @@ def train(farm_id):
         index=x_processed.index
     )
     
-    # 特征选择
-    selector = SelectFromModel(
-        RandomForestRegressor(n_estimators=100, random_state=42),
-        threshold='median'
-    )
-    selector.fit(x_processed_scaled, y_processed)
-    selected_features = x_processed_scaled.columns[selector.get_support()]
-    x_processed_selected = x_processed_scaled[selected_features]
+    # 划分训练集和验证集 (使用时间序列分割)
+    tscv = TimeSeriesSplit(n_splits=5)
+    # 取最后一个分割作为训练/验证集
+    for train_index, val_index in tscv.split(x_processed_scaled):
+        pass  # 我们只使用最后一个分割
     
-    print(f"选择了 {len(selected_features)} 个特征，从总共 {x_processed_scaled.shape[1]} 个")
+    X_train = x_processed_scaled.iloc[train_index]
+    y_train = y_processed.iloc[train_index]
+    X_val = x_processed_scaled.iloc[val_index]
+    y_val = y_processed.iloc[val_index]
     
-    # 创建模型
-    model_lgb = lgb.LGBMRegressor(
-        n_estimators=200,
-        learning_rate=0.05,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    model_xgb = xgb.XGBRegressor(
-        n_estimators=200,
-        learning_rate=0.05,
-        max_depth=10,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    model_rf = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=5,
-        random_state=42
-    )
+    # 创建PyTorch数据集和数据加载器
+    train_dataset = PowerGenerationDataset(X_train, y_train)
+    val_dataset = PowerGenerationDataset(X_val, y_val)
     
-    # 集成模型
-    final_model = VotingRegressor(
-        estimators=[
-            ('lgb', model_lgb),
-            ('xgb', model_xgb),
-            ('rf', model_rf)
-        ],
-        weights=[0.4, 0.4, 0.2]
-    )
+    batch_size = 64
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    # 确定模型是风电场还是光伏场站
+    is_wind_farm = farm_id in WIND_FARMS
+    
+    # 初始化模型
+    input_size = X_train.shape[1]
+    model = HybridModel(
+        input_size=input_size,
+        hidden_dims=[256, 128],
+        lstm_hidden_size=64,
+        num_layers=2,
+        dropout=0.3
+    ).to(device)
+    
+    # 定义损失函数和优化器
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
     
     # 训练模型
-    final_model.fit(x_processed_selected, y_processed)
+    num_epochs = 100
+    best_val_loss = float('inf')
+    patience = 15
+    counter = 0
+    best_model_state = None
     
-    # 评估模型
-    y_pred = final_model.predict(x_processed_selected)
-    train_rmse = np.sqrt(mean_squared_error(y_processed, y_pred))
-    train_r2 = r2_score(y_processed, y_pred)
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        train_loss /= len(train_loader)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_true = []
+        
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                
+                val_preds.extend(outputs.cpu().numpy())
+                val_true.extend(batch_y.cpu().numpy())
+        
+        val_loss /= len(val_loader)
+        val_rmse = np.sqrt(mean_squared_error(val_true, val_preds))
+        val_r2 = r2_score(val_true, val_preds)
+        
+        # 打印训练进度
+        if epoch % 10 == 0:
+            print(f'Epoch {epoch}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Val RMSE: {val_rmse:.6f}, Val R2: {val_r2:.4f}')
+        
+        # 学习率调整
+        scheduler.step(val_loss)
+        
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = model.state_dict().copy()
+            counter = 0
+        else:
+            counter += 1
+        
+        # 早停
+        if counter >= patience:
+            print(f'早停：连续 {patience} 个轮次验证损失未改善')
+            break
+    
+    # 加载最佳模型状态
+    model.load_state_dict(best_model_state)
+    
+    # 在整个训练集上重新训练一次
+    print("在完整训练集上进行最终训练...")
+    full_dataset = PowerGenerationDataset(x_processed_scaled, y_processed)
+    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
+    
+    final_model = HybridModel(
+        input_size=input_size,
+        hidden_dims=[256, 128],
+        lstm_hidden_size=64,
+        num_layers=2,
+        dropout=0.3
+    ).to(device)
+    final_model.load_state_dict(best_model_state)
+    
+    # 使用较小的学习率进行微调
+    final_optimizer = optim.Adam(final_model.parameters(), lr=0.0005, weight_decay=1e-5)
+    
+    final_epochs = 10
+    for epoch in range(final_epochs):
+        final_model.train()
+        epoch_loss = 0.0
+        for batch_X, batch_y in full_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
+            final_optimizer.zero_grad()
+            outputs = final_model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            final_optimizer.step()
+            
+            epoch_loss += loss.item()
+        
+        if epoch % 2 == 0:
+            print(f'最终训练 Epoch {epoch}/{final_epochs}, Loss: {epoch_loss/len(full_loader):.6f}')
+    
+    # 评估最终模型
+    final_model.eval()
+    with torch.no_grad():
+        all_X = torch.tensor(x_processed_scaled.values, dtype=torch.float32).to(device)
+        all_preds = final_model(all_X).cpu().numpy()
+    
+    train_rmse = np.sqrt(mean_squared_error(y_processed, all_preds))
+    train_r2 = r2_score(y_processed, all_preds)
     
     print(f"发电站 {farm_id} 训练评估: RMSE = {train_rmse:.4f}, R² = {train_r2:.4f}")
     
     # 返回所有需要保存的组件
     model_package = {
-        'model': final_model,
+        'model': final_model.to('cpu'),  # 保存到CPU避免GPU内存问题
         'scaler': scaler,
-        'feature_selector': selector,
-        'selected_features': selected_features
+        'input_size': input_size,
+        'accuracy': train_r2,
+        'is_wind_farm': is_wind_farm
     }
     
     return model_package
 
 def predict(model_package, farm_id):
-    """增强版预测函数"""
+    """基于深度学习的预测函数"""
     # 解包模型组件
-    final_model = model_package['model']
+    model = model_package['model'].to(device)
     scaler = model_package['scaler']
-    selector = model_package['feature_selector']
-    selected_features = model_package['selected_features']
+    model.eval()  # 设置为评估模式
     
     # 读取测试数据
     x_df = pd.DataFrame()
@@ -357,16 +558,17 @@ def predict(model_package, farm_id):
         index=x_test.index
     )
     
-    # 确保使用与训练完全相同的特征集和顺序
-    x_test_selected = pd.DataFrame(index=x_test_scaled.index)
-    for feature in selected_features:
-        if feature in x_test_scaled.columns:
-            x_test_selected[feature] = x_test_scaled[feature]
-        else:
-            x_test_selected[feature] = 0
+    # 创建PyTorch测试数据集和数据加载器
+    test_dataset = PowerGenerationDataset(x_test_scaled)
+    test_loader = DataLoader(test_dataset, batch_size=64)
     
     # 预测
-    pred_pw = final_model.predict(x_test_selected).flatten()
+    pred_pw = []
+    with torch.no_grad():
+        for batch_X in test_loader:
+            batch_X = batch_X.to(device)
+            outputs = model(batch_X)
+            pred_pw.extend(outputs.cpu().numpy())
     
     # 创建预测序列
     pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
@@ -382,12 +584,12 @@ def predict(model_package, farm_id):
 
 def main():
     """主程序执行函数，处理所有场站的训练与预测"""
-    print("===== 新能源功率预报系统启动 =====")
+    print("===== 新能源功率预报系统启动 - 深度学习版 =====")
     print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 创建必要的目录
     os.makedirs('models', exist_ok=True)
-    os.makedirs('output/output', exist_ok=True)
+    os.makedirs('output', exist_ok=True)
     
     # 处理所有场站
     farms = WIND_FARMS + SOLAR_FARMS
@@ -402,7 +604,7 @@ def main():
             print(f"\n===== 开始处理发电站 {farm_id} =====")
             model_path = f'models/{farm_id}'
             os.makedirs(model_path, exist_ok=True)
-            model_file = os.path.join(model_path, 'enhanced_model.pkl')
+            model_file = os.path.join(model_path, 'deep_learning_model.pkl')
             
             # 判断是否已有训练好的模型
             if os.path.exists(model_file) and os.path.getsize(model_file) > 0:
@@ -427,7 +629,7 @@ def main():
                 accuracies[farm_id] = model_package['accuracy']
             
             # 保存预测结果
-            output_file = os.path.join('output/output', f'output{farm_id}.csv')
+            output_file = os.path.join('output', f'output{farm_id}.csv')
             pred.to_csv(output_file)
             print(f"预测结果已保存至: {output_file}")
             print(f"发电站 {farm_id} 处理完成")
