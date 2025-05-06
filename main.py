@@ -37,7 +37,7 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 
-# 检查是否可用CUDA
+# 检查是否可用 CUDA
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"使用设备: {device}")
 
@@ -72,11 +72,13 @@ def add_weather_derivatives(df, is_wind_farm=True):
     v_cols = [col for col in df_copy.columns if '_v_' in col]
     
     if u_cols and v_cols:
-        # 计算平均风向
-        df_copy['mean_u'] = df_copy[u_cols].mean(axis=1)
-        df_copy['mean_v'] = df_copy[v_cols].mean(axis=1)
-        df_copy['wind_direction'] = np.arctan2(df_copy['mean_v'], df_copy['mean_u']) * 180 / np.pi
-        df_copy['wind_direction'] = df_copy['wind_direction'].apply(lambda x: x + 360 if x < 0 else x)
+        # 计算风速和原始风向角（度）
+        u = df_copy[u_cols[0]]
+        v = df_copy[v_cols[0]]
+        df_copy['wind_speed'] = np.sqrt(u**2 + v**2)
+        wd = np.degrees(np.arctan2(v, u))
+        # 将负角度转换到 [0,360)
+        df_copy['wind_direction'] = np.where(wd < 0, wd + 360, wd)
         
         # 添加风向的正弦和余弦分量以避免周期性问题
         df_copy['sin_wind_dir'] = np.sin(np.radians(df_copy['wind_direction']))
@@ -502,7 +504,14 @@ def train(farm_id):
         max_depth=10,
         subsample=0.8,
         colsample_bytree=0.8,
-        random_state=RANDOM_SEED
+        random_state=RANDOM_SEED,
+        eval_metric='rmse'             # 指标放到构造函数里
+    )
+    model_xgb.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],     # 验证集
+        early_stopping_rounds=20,      # 早停
+        verbose=False                  # 不输出过多日志
     )
     model_rf = RandomForestRegressor(
         n_estimators=100,
@@ -519,12 +528,6 @@ def train(farm_id):
             lgb.early_stopping(stopping_rounds=20),
             lgb.log_evaluation(period=0)
         ]
-    )
-    model_xgb.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        early_stopping_rounds=20,
-        verbose=False
     )
     model_rf.fit(X_tr, y_tr)
     
