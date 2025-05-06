@@ -387,7 +387,7 @@ def main():
     
     # 创建必要的目录
     os.makedirs('models', exist_ok=True)
-    os.makedirs('result/output', exist_ok=True)
+    os.makedirs('output/output', exist_ok=True)
     
     # 处理所有场站
     farms = WIND_FARMS + SOLAR_FARMS
@@ -427,9 +427,9 @@ def main():
                 accuracies[farm_id] = model_package['accuracy']
             
             # 保存预测结果
-            result_file = os.path.join('result/output', f'output{farm_id}.csv')
-            pred.to_csv(result_file)
-            print(f"预测结果已保存至: {result_file}")
+            output_file = os.path.join('output/output', f'output{farm_id}.csv')
+            pred.to_csv(output_file)
+            print(f"预测结果已保存至: {output_file}")
             print(f"发电站 {farm_id} 处理完成")
             
         except Exception as e:
@@ -448,13 +448,16 @@ def main():
     # 打包所有输出结果
     try:
         import zipfile
-        output_files = [f'output{i}.csv' for i in farms]
-        with zipfile.ZipFile('result/output.zip', 'w') as zipf:
-            for file in output_files:
-                file_path = os.path.join('result/output', file)
-                if os.path.exists(file_path):
-                    zipf.write(file_path, arcname=file)
-        print(f"所有预测结果已打包至: result/output.zip")
+        
+        output_zip_path = 'output.zip'
+        with zipfile.ZipFile(output_zip_path, 'w') as zipf:
+            for root, dirs, files in os.walk('output'):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, os.path.dirname('output'))
+                    zipf.write(file_path, arcname=rel_path)
+        
+        print(f"整个output目录已打包至: {output_zip_path}")
     except Exception as e:
         print(f"打包输出结果时发生错误: {e}")
     
