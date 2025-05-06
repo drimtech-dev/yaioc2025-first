@@ -12,7 +12,7 @@ from sklearn.feature_selection import SelectFromModel
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit, train_test_split, train_test_split
 from scipy.interpolate import CubicSpline
 import torch
 from torch import nn
@@ -21,7 +21,7 @@ from torch.optim import Adam
 import torch.nn.functional as F
 import argparse
 
-# 定义风电场和光伏场站ID
+# 定义风电场和光伏场站 ID
 WIND_FARMS = [1, 2, 3, 4, 5]
 SOLAR_FARMS = [6, 7, 8, 9, 10]
 
@@ -458,10 +458,15 @@ def train(farm_id):
     # 预处理数据
     x_processed, y_processed = data_preprocess(x_df, y_df, is_train=True)
     
-    # 特征标准化
-    scaler = StandardScaler()
+    # 特征异常值截断(1%~99%)
+    lower = x_processed.quantile(0.01)
+    upper = x_processed.quantile(0.99)
+    x_processed = x_processed.clip(lower=lower, upper=upper, axis=1)
+    
+    # 特征标准化(使用RobustScaler减少异常值影响)
+    scaler = RobustScaler()
     x_processed_scaled = pd.DataFrame(
-        scaler.fit_transform(x_processed), 
+        scaler.fit_transform(x_processed),
         columns=x_processed.columns,
         index=x_processed.index
     )
@@ -477,7 +482,12 @@ def train(farm_id):
     
     print(f"选择了 {len(selected_features)} 个特征，从总共 {x_processed_scaled.shape[1]} 个")
     
-    # 创建树模型
+    # 划分树模型训练/验证集，启用 early stopping
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        x_processed_selected, y_processed,
+        test_size=0.2, random_state=RANDOM_SEED
+    )
+    
     model_lgb = lgb.LGBMRegressor(
         n_estimators=200,
         learning_rate=0.05,
@@ -501,10 +511,19 @@ def train(farm_id):
         random_state=RANDOM_SEED
     )
     
-    # 训练树模型
-    model_lgb.fit(x_processed_selected, y_processed)
-    model_xgb.fit(x_processed_selected, y_processed)
-    model_rf.fit(x_processed_selected, y_processed)
+    model_lgb.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        early_stopping_rounds=20,
+        verbose=False
+    )
+    model_xgb.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        early_stopping_rounds=20,
+        verbose=False
+    )
+    model_rf.fit(X_tr, y_tr)
     
     # 预处理深度学习模型的数据
     seq_length = 24  # 使用24小时的历史数据
