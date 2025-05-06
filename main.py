@@ -546,8 +546,8 @@ def train(farm_id):
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64)
     
     # 创建深度学习模型
     input_dim = X_seq_scaled.shape[2]  # 特征维度
@@ -579,7 +579,7 @@ def train(farm_id):
     torch.cuda.empty_cache()
     
     inference_dataset = TensorDataset(X_tensor, y_tensor)
-    inference_loader = DataLoader(inference_dataset, batch_size=32)
+    inference_loader = DataLoader(inference_dataset, batch_size=64)
     
     lstm_model.eval()
     cnn_lstm_model.eval()
