@@ -14,8 +14,6 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.model_selection import TimeSeriesSplit
 from scipy.interpolate import CubicSpline
-
-# 导入PyTorch相关库
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, TensorDataset
@@ -286,7 +284,7 @@ def create_sequences(data, target=None, seq_length=24):
     for i in range(seq_length, len(data)):
         X.append(data.iloc[i-seq_length:i].values)
         if target is not None:
-            y.append(target.iloc[i])
+            y.append(target.iloc[i].values)
     
     if target is not None:
         return np.array(X), np.array(y)
@@ -295,6 +293,10 @@ def create_sequences(data, target=None, seq_length=24):
 
 def train_pytorch_model(model, train_loader, val_loader, num_epochs=100, patience=10):
     """训练PyTorch模型并进行早停"""
+    # 每次训练前清空显存统计
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        
     model.to(device)
     criterion = nn.MSELoss()
     optimizer = Adam(model.parameters(), lr=0.001)
@@ -351,6 +353,12 @@ def train_pytorch_model(model, train_loader, val_loader, num_epochs=100, patienc
     
     # 恢复最佳模型状态
     model.load_state_dict(best_model_state)
+    
+    # 输出峰值显存占用
+    if torch.cuda.is_available():
+        peak_bytes = torch.cuda.max_memory_allocated(device=device)
+        print(f"训练过程峰值显存占用: {peak_bytes / 1024**3:.2f} GiB")
+        
     return model, best_val_loss
 
 def data_preprocess(x_df, y_df=None, is_train=True, is_dl_model=False, seq_length=24):
@@ -671,6 +679,10 @@ def predict(model_package, farm_id):
     
     X_tensor_test = torch.FloatTensor(X_seq_test_scaled).to(device)
     
+    # 预测前清空显存统计
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    
     # 深度学习模型预测
     dl_models['lstm'].eval()
     dl_models['cnn_lstm'].eval()
@@ -678,6 +690,11 @@ def predict(model_package, farm_id):
     with torch.no_grad():
         lstm_pred = dl_models['lstm'](X_tensor_test).cpu().numpy().flatten()
         cnn_lstm_pred = dl_models['cnn_lstm'](X_tensor_test).cpu().numpy().flatten()
+    
+    # 输出预测过程峰值显存占用
+    if torch.cuda.is_available():
+        peak_bytes = torch.cuda.max_memory_allocated(device=device)
+        print(f"预测过程峰值显存占用: {peak_bytes / 1024**3:.2f} GiB")
     
     # 集成预测
     final_pred = (tree_ensemble_pred * ensemble_weights['tree'] +
