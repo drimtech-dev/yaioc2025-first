@@ -781,7 +781,6 @@ def main(predict_only=False):
     # 打包输出...
     try:
         import zipfile
-        import os
         
         # 将输出放在上级目录
         zip_path = 'output.zip'
