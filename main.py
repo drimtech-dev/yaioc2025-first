@@ -2,6 +2,7 @@ import os
 import pickle
 import warnings
 from datetime import datetime
+from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -21,6 +22,39 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torch.nn.functional as F
+
+class EarlyStopping:
+    def __init__(self, patience=7, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+        self.delta = delta
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...')
+        torch.save(model.state_dict(), 'checkpoint.pt')
+        self.val_loss_min = val_loss
 
 # 定义风电场和光伏场站ID
 WIND_FARMS = [1, 2, 3, 4, 5]
@@ -48,9 +82,17 @@ if torch.cuda.is_available():
 # 创建自定义Dataset
 class PowerGenerationDataset(Dataset):
     def __init__(self, features, targets=None):
-        self.features = torch.tensor(features.values, dtype=torch.float32)
+        # 检查是否是pandas对象，如果是则获取numpy数组
+        if hasattr(features, 'values'):
+            self.features = torch.tensor(features.values, dtype=torch.float32)
+        else:
+            self.features = torch.tensor(features, dtype=torch.float32)
+            
         if targets is not None:
-            self.targets = torch.tensor(targets.values, dtype=torch.float32)
+            if hasattr(targets, 'values'):
+                self.targets = torch.tensor(targets.values, dtype=torch.float32)
+            else:
+                self.targets = torch.tensor(targets, dtype=torch.float32)
             self.has_targets = True
         else:
             self.has_targets = False
@@ -86,49 +128,56 @@ class LSTMModel(nn.Module):
 
 # 定义混合模型 (MLP + LSTM)
 class HybridModel(nn.Module):
-    def __init__(self, input_size, hidden_dims=[256, 128], lstm_hidden_size=64, num_layers=2, dropout=0.3):
+    def __init__(self, input_size, hidden_dims, lstm_hidden_size, num_layers, dropout=0.3):
         super(HybridModel, self).__init__()
         
-        # MLP部分
-        mlp_layers = []
+        # 特征提取器 - 改进的MLP部分
+        layers = []
         prev_dim = input_size
         for hidden_dim in hidden_dims:
-            mlp_layers.append(nn.Linear(prev_dim, hidden_dim))
-            mlp_layers.append(nn.ReLU())
-            mlp_layers.append(nn.BatchNorm1d(hidden_dim))
-            mlp_layers.append(nn.Dropout(dropout))
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
-            
-        self.mlp = nn.Sequential(*mlp_layers)
         
-        # LSTM部分
+        self.feature_extractor = nn.Sequential(*layers)
+        
+        # 改进的LSTM层
         self.lstm = nn.LSTM(
-            input_size=input_size,
+            input_size=hidden_dims[-1],
             hidden_size=lstm_hidden_size,
             num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
         )
         
-        # 合并层
-        self.fc1 = nn.Linear(hidden_dims[-1] + lstm_hidden_size, 64)
-        self.fc2 = nn.Linear(64, 1)
+        # 注意力机制
+        self.attention = nn.MultiheadAttention(embed_dim=lstm_hidden_size, num_heads=4)
         
+        # 输出层
+        self.fc = nn.Linear(lstm_hidden_size, 1)
+    
     def forward(self, x):
-        # MLP路径
-        mlp_out = self.mlp(x)
+        batch_size = x.size(0)
+        seq_len = 1  # 假设是单时间步，如果是序列数据需要调整
         
-        # LSTM路径
-        lstm_in = x.unsqueeze(1)  # 添加序列维度
-        lstm_out, _ = self.lstm(lstm_in)
-        lstm_out = lstm_out.squeeze(1)  # 移除序列维度
+        # 特征提取
+        x = self.feature_extractor(x)
         
-        # 合并MLP和LSTM输出
-        combined = torch.cat([mlp_out, lstm_out], dim=1)
-        x = F.relu(self.fc1(combined))
-        output = self.fc2(x)
+        # 重塑以适应LSTM (batch_size, seq_len, features)
+        x = x.view(batch_size, seq_len, -1)
         
-        return output.squeeze(-1)  # 确保输出维度是 [batch_size]
+        # LSTM处理
+        lstm_out, _ = self.lstm(x)
+        
+        # 应用注意力
+        attn_out, _ = self.attention(lstm_out.transpose(0, 1), lstm_out.transpose(0, 1), lstm_out.transpose(0, 1))
+        attn_out = attn_out.transpose(0, 1)
+        
+        # 输出预测
+        out = self.fc(attn_out[:, -1, :])
+        return out
 
 def add_time_features(df):
     """添加时间特征"""
@@ -285,7 +334,21 @@ def data_preprocess(x_df, y_df=None, is_train=True):
         y_df[y_df < 0] = 0
         y_df[y_df > 1] = 1
         
-        return x_df, y_df
+        # 标准化数据
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        
+        X_scaled = scaler_X.fit_transform(x_df)
+        y_scaled = scaler_y.fit_transform(y_df.values.reshape(-1, 1)).flatten()
+        
+        # 分割训练集和验证集
+        split_idx = int(len(X_scaled) * 0.8)
+        X_train = X_scaled[:split_idx]
+        X_val = X_scaled[split_idx:]
+        y_train = y_scaled[:split_idx]
+        y_val = y_scaled[split_idx:]
+        
+        return X_train, X_val, y_train, y_val, scaler_X, scaler_y
     else:
         # 测试数据处理
         # 仅填充滞后特征的缺失值
@@ -295,8 +358,12 @@ def data_preprocess(x_df, y_df=None, is_train=True):
         return x_df
 
 def train(farm_id):
-    """基于深度学习的训练函数"""
+    """改进的基于深度学习的训练函数"""
     print(f"开始训练发电站 {farm_id} 的深度学习模型...")
+    
+    # 创建模型保存路径
+    model_path = f'models/{farm_id}'
+    os.makedirs(model_path, exist_ok=True)
     
     # 读取和准备数据
     x_df = pd.DataFrame()
@@ -337,176 +404,136 @@ def train(farm_id):
     # 添加滞后特征
     x_df = add_lag_features(x_df)
     
-    # 预处理数据
-    x_processed, y_processed = data_preprocess(x_df, y_df, is_train=True)
+    # 特征选择 - 增加相关性分析
+    corr_matrix = pd.concat([x_df, y_df], axis=1).corr()
+    relevant_features = corr_matrix['power'].abs().sort_values(ascending=False)
+    print(f"Top 20 most relevant features: {relevant_features.head(20).index.tolist()}")
     
-    # 特征标准化
-    scaler = StandardScaler()
-    x_processed_scaled = pd.DataFrame(
-        scaler.fit_transform(x_processed), 
-        columns=x_processed.columns,
-        index=x_processed.index
-    )
-    
-    # 划分训练集和验证集 (使用时间序列分割)
-    tscv = TimeSeriesSplit(n_splits=5)
-    # 取最后一个分割作为训练/验证集
-    for train_index, val_index in tscv.split(x_processed_scaled):
-        pass  # 我们只使用最后一个分割
-    
-    X_train = x_processed_scaled.iloc[train_index]
-    y_train = y_processed.iloc[train_index]
-    X_val = x_processed_scaled.iloc[val_index]
-    y_val = y_processed.iloc[val_index]
+    # 数据预处理
+    X_train, X_val, y_train, y_val, scaler_X, scaler_y = data_preprocess(x_df, y_df)
     
     # 创建PyTorch数据集和数据加载器
     train_dataset = PowerGenerationDataset(X_train, y_train)
     val_dataset = PowerGenerationDataset(X_val, y_val)
     
-    batch_size = 64
+    batch_size = 128  # 增加批量大小以提高稳定性
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
     # 确定模型是风电场还是光伏场站
     is_wind_farm = farm_id in WIND_FARMS
     
-    # 初始化模型
+    # 初始化改进后的模型
     input_size = X_train.shape[1]
     model = HybridModel(
         input_size=input_size,
-        hidden_dims=[256, 128],
-        lstm_hidden_size=64,
-        num_layers=2,
-        dropout=0.3
+        hidden_dims=[512, 256, 128],  # 更复杂的网络架构
+        lstm_hidden_size=128,
+        num_layers=3,
+        dropout=0.4  # 增加dropout以减轻过拟合
     ).to(device)
     
     # 定义损失函数和优化器
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)  # 使用AdamW并添加权重衰减
     
-    # 训练模型
-    num_epochs = 100
-    best_val_loss = float('inf')
-    patience = 15
-    counter = 0
-    best_model_state = None
+    # 添加学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    
+    # 早停机制
+    early_stopping = EarlyStopping(patience=15, verbose=True, delta=0.0001)
+    
+    # 训练循环
+    num_epochs = 200  # 增加最大轮次，配合早停使用
+    train_losses = []
+    val_losses = []
     
     for epoch in range(num_epochs):
         # 训练阶段
         model.train()
         train_loss = 0.0
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
-            optimizer.step()
             
-            train_loss += loss.item()
+            # 梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            train_loss += loss.item() * inputs.size(0)
         
-        train_loss /= len(train_loader)
+        train_loss = train_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
         
         # 验证阶段
         model.eval()
         val_loss = 0.0
-        val_preds = []
-        val_true = []
+        predictions = []
+        actual_values = []
         
         with torch.no_grad():
-            for batch_X, batch_y in val_loader:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item()
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
                 
-                val_preds.extend(outputs.cpu().numpy())
-                val_true.extend(batch_y.cpu().numpy())
+                # 收集预测和实际值用于计算额外的指标
+                predictions.extend(outputs.cpu().numpy())
+                actual_values.extend(targets.cpu().numpy())
         
-        val_loss /= len(val_loader)
-        val_rmse = np.sqrt(mean_squared_error(val_true, val_preds))
-        val_r2 = r2_score(val_true, val_preds)
+        val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
         
-        # 打印训练进度
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Val RMSE: {val_rmse:.6f}, Val R2: {val_r2:.4f}')
+        # 计算额外的评估指标
+        mae = mean_absolute_error(actual_values, predictions)
+        r2 = r2_score(actual_values, predictions)
         
-        # 学习率调整
+        # 更新学习率调度器
         scheduler.step(val_loss)
         
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
-            counter = 0
-        else:
-            counter += 1
+        # 打印当前轮次的结果
+        print(f"Epoch {epoch+1}/{num_epochs} | "
+              f"Train Loss: {train_loss:.6f} | "
+              f"Val Loss: {val_loss:.6f} | "
+              f"MAE: {mae:.4f} | "
+              f"R²: {r2:.4f}")
         
-        # 早停
-        if counter >= patience:
-            print(f'早停：连续 {patience} 个轮次验证损失未改善')
+        # 早停检查
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("早停激活! 停止训练。")
             break
     
-    # 加载最佳模型状态
-    model.load_state_dict(best_model_state)
+    # 加载最佳模型
+    model.load_state_dict(torch.load(f'checkpoint_{farm_id}.pt'))
     
-    # 在整个训练集上重新训练一次
-    print("在完整训练集上进行最终训练...")
-    full_dataset = PowerGenerationDataset(x_processed_scaled, y_processed)
-    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
-    
-    final_model = HybridModel(
-        input_size=input_size,
-        hidden_dims=[256, 128],
-        lstm_hidden_size=64,
-        num_layers=2,
-        dropout=0.3
-    ).to(device)
-    final_model.load_state_dict(best_model_state)
-    
-    # 使用较小的学习率进行微调
-    final_optimizer = optim.Adam(final_model.parameters(), lr=0.0005, weight_decay=1e-5)
-    
-    final_epochs = 10
-    for epoch in range(final_epochs):
-        final_model.train()
-        epoch_loss = 0.0
-        for batch_X, batch_y in full_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            
-            final_optimizer.zero_grad()
-            outputs = final_model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            final_optimizer.step()
-            
-            epoch_loss += loss.item()
-        
-        if epoch % 2 == 0:
-            print(f'最终训练 Epoch {epoch}/{final_epochs}, Loss: {epoch_loss/len(full_loader):.6f}')
-    
-    # 评估最终模型
-    final_model.eval()
-    with torch.no_grad():
-        all_X = torch.tensor(x_processed_scaled.values, dtype=torch.float32).to(device)
-        all_preds = final_model(all_X).cpu().numpy()
-    
-    train_rmse = np.sqrt(mean_squared_error(y_processed, all_preds))
-    train_r2 = r2_score(y_processed, all_preds)
-    
-    print(f"发电站 {farm_id} 训练评估: RMSE = {train_rmse:.4f}, R² = {train_r2:.4f}")
-    
-    # 返回所有需要保存的组件
+    # 保存模型和缩放器
     model_package = {
-        'model': final_model.to('cpu'),  # 保存到CPU避免GPU内存问题
-        'scaler': scaler,
+        'model': model.state_dict(),
+        'scaler_X': scaler_X,
+        'scaler_y': scaler_y,
         'input_size': input_size,
-        'accuracy': train_r2,
-        'is_wind_farm': is_wind_farm
+        'farm_id': farm_id
     }
     
+    # 绘制训练曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title(f'Training and Validation Loss for {farm_id}')
+    plt.legend()
+    plt.savefig(f'loss_curve_{farm_id}.png')
+    
+    torch.save(model_package, os.path.join(model_path, f"{farm_id}_model.pth"))
     return model_package
 
 def predict(model_package, farm_id):
