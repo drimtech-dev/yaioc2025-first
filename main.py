@@ -19,6 +19,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 from torch.optim import Adam
 import torch.nn.functional as F
+import argparse
 
 # 定义风电场和光伏场站ID
 WIND_FARMS = [1, 2, 3, 4, 5]
@@ -626,8 +627,8 @@ def predict(model_package, farm_id):
     tree_models = model_package['tree_models']
     dl_models = model_package['dl_models']
     ensemble_weights = model_package['ensemble_weights']
+    selector = model_package['feature_selector']
     scaler = model_package['scaler']
-    selector = model_package['selector']
     selected_features = model_package['selected_features']
     seq_length = model_package['seq_length']
     
@@ -677,10 +678,9 @@ def predict(model_package, farm_id):
     lgb_pred = tree_models['lgb'].predict(x_test_selected)
     xgb_pred = tree_models['xgb'].predict(x_test_selected)
     rf_pred = tree_models['rf'].predict(x_test_selected)
-    
     tree_preds = np.column_stack([lgb_pred, xgb_pred, rf_pred])
     tree_ensemble_pred = np.sum(tree_preds * tree_models['tree_weights'].reshape(1, -1), axis=1)
-    
+
     # 深度学习模型预测准备
     X_seq_test = data_preprocess(x_df, is_train=False, is_dl_model=True, seq_length=seq_length)
     
@@ -707,56 +707,72 @@ def predict(model_package, farm_id):
         peak_bytes = torch.cuda.max_memory_allocated(device=device)
         print(f"预测过程峰值显存占用: {peak_bytes / 1024**3:.2f} GiB")
     
-    # 集成预测
-    final_pred = (tree_ensemble_pred * ensemble_weights['tree'] +
-                  lstm_pred * ensemble_weights['lstm'] +
-                  cnn_lstm_pred * ensemble_weights['cnn_lstm'])
+    # 对齐：移除树模型最前面 seq_length 条，多出的预测
+    tree_aligned = tree_ensemble_pred[seq_length:]
+    # 此时 tree_aligned、lstm_pred、cnn_lstm_pred 都长度为 (len(x_df) - seq_length)
     
+    # 集成预测
+    final_pred = (
+        tree_aligned * ensemble_weights['tree'] +
+        lstm_pred  * ensemble_weights['lstm'] +
+        cnn_lstm_pred * ensemble_weights['cnn_lstm']
+    )
+
     return final_pred
 
-def main():
+def main(predict_only=False):
     """主函数，训练和预测所有风电场和光伏场站"""
-    # 确保存储模型和结果的目录存在
     os.makedirs('models', exist_ok=True)
-    os.makedirs('result', exist_ok=True)
-    
+    os.makedirs('output', exist_ok=True)
+
+    # 存放所有模型包
     model_packages = {}
-    
-    # 训练所有风电场和光伏场站的模型
+
+    # 循环所有场站
     for farm_id in WIND_FARMS + SOLAR_FARMS:
-        model_package = train(farm_id)
+        model_file = f'models/model_package_{farm_id}.pkl'
+        if predict_only and os.path.exists(model_file):
+            # 直接加载已有模型包
+            with open(model_file, 'rb') as f:
+                model_package = pickle.load(f)
+            print(f"已加载模型：{model_file}，跳过训练")
+        else:
+            # 训练并保存
+            model_package = train(farm_id)
+            with open(model_file, 'wb') as f:
+                pickle.dump(model_package, f)
+            print(f"训练并保存模型：{model_file}")
         model_packages[farm_id] = model_package
-        
-        # 保存模型包
-        with open(f'models/model_package_{farm_id}.pkl', 'wb') as f:
-            pickle.dump(model_package, f)
-    
-    # 预测所有风电场和光伏场站的功率
+
+    # 统一做预测
     predictions = {}
-    for farm_id in WIND_FARMS + SOLAR_FARMS:
-        with open(f'models/model_package_{farm_id}.pkl', 'rb') as f:
-            model_package = pickle.load(f)
-        
+    for farm_id, model_package in model_packages.items():
         pred = predict(model_package, farm_id)
         predictions[farm_id] = pred
-        
-        # 保存预测结果
+        # 保存结果
         pred_df = pd.DataFrame(pred, columns=['predicted_power'])
-        pred_df.index = pd.date_range(datetime(1969, 1, 1, 0), datetime(1969, 1, 31, 23), freq='h')
-        pred_df.to_csv(f'result/prediction_{farm_id}.csv')
-    
-    # 打包所有预测结果
+        pred_df.index = pd.date_range(datetime(1969,1,1), periods=len(pred), freq='h')
+        pred_df.to_csv(f'output/output{farm_id}.csv')
+
+    # 打包输出...
     try:
         import zipfile
-        with zipfile.ZipFile('result/output.zip', 'w') as zipf:
+        with zipfile.ZipFile('output/output.zip', 'w') as zipf:
             for farm_id in WIND_FARMS + SOLAR_FARMS:
-                zipf.write(f'result/prediction_{farm_id}.csv')
+                zipf.write(f'output/prediction_{farm_id}.csv')
         
-        print(f"所有预测结果已打包至: result/output.zip")
+        print(f"所有预测结果已打包至: output/output.zip")
     except Exception as e:
         print(f"打包输出结果时发生错误: {e}")
     
     print("\n===== 新能源功率预报系统运行完成 =====")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-p', '--predict-only',
+        action='store_true',
+        help='仅执行已有模型的预测，跳过训练'
+    )
+    args = parser.parse_args()
+    main(predict_only=args.predict_only)
