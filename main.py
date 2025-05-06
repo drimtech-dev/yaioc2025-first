@@ -514,8 +514,11 @@ def train(farm_id):
     model_lgb.fit(
         X_tr, y_tr,
         eval_set=[(X_val, y_val)],
-        early_stopping_rounds=20,
-        verbose=False
+        eval_metric='rmse',
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=20),
+            lgb.log_evaluation(period=0)
+        ]
     )
     model_xgb.fit(
         X_tr, y_tr,
