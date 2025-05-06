@@ -782,11 +782,23 @@ def main(predict_only=False):
     # 打包输出...
     try:
         import zipfile
-        with zipfile.ZipFile('output/output.zip', 'w') as zipf:
-            for farm_id in WIND_FARMS + SOLAR_FARMS:
-                zipf.write(f'output/prediction_{farm_id}.csv')
+        import os
         
-        print(f"所有预测结果已打包至: output/output.zip")
+        # 将输出放在上级目录
+        zip_path = 'output.zip'
+        
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            # 遍历整个output目录
+            for root, dirs, files in os.walk('output'):
+                for file in files:
+                    # 获取文件的完整路径
+                    file_path = os.path.join(root, file)
+                    # 获取相对于output的路径用于保持目录结构
+                    arcname = os.path.relpath(file_path, 'output')
+                    # 将文件添加到zip中
+                    zipf.write(file_path, arcname=os.path.join('output', arcname))
+        
+        print(f"整个output目录已打包至: {zip_path}")
     except Exception as e:
         print(f"打包输出结果时发生错误: {e}")
     
