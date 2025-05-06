@@ -510,8 +510,7 @@ def train(farm_id):
     model_xgb.fit(
         X_tr, y_tr,
         eval_set=[(X_val, y_val)],     # 验证集
-        early_stopping_rounds=20,      # 早停
-        verbose=False                  # 不输出过多日志
+        verbose=True                  # 开启输出以查看训练进度
     )
     model_rf = RandomForestRegressor(
         n_estimators=100,
