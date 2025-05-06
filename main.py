@@ -553,13 +553,24 @@ def train(farm_id):
     rf_pred = model_rf.predict(x_processed_selected)
     
     # 深度学习模型评估
+    # 分批推理以避免 OOM
+    # 先释放训练时不再需要的变量
+    del train_loader, val_loader, train_dataset, val_dataset
+    torch.cuda.empty_cache()
+    
+    inference_dataset = TensorDataset(X_tensor, y_tensor)
+    inference_loader = DataLoader(inference_dataset, batch_size=32)
+    
     lstm_model.eval()
     cnn_lstm_model.eval()
-    
+    lstm_preds, cnn_lstm_preds = [], []
     with torch.no_grad():
-        X_tensor_gpu = X_tensor.to(device)  # 将输入数据移到GPU
-        lstm_pred = lstm_model(X_tensor_gpu).cpu().numpy().flatten()
-        cnn_lstm_pred = cnn_lstm_model(X_tensor_gpu).cpu().numpy().flatten()
+        for X_batch, _ in inference_loader:
+            Xb = X_batch.to(device)
+            lstm_preds.append(lstm_model(Xb).cpu().numpy().flatten())
+            cnn_lstm_preds.append(cnn_lstm_model(Xb).cpu().numpy().flatten())
+    lstm_pred = np.concatenate(lstm_preds)
+    cnn_lstm_pred = np.concatenate(cnn_lstm_preds)
     
     # 集成预测
     tree_preds = np.column_stack([lgb_pred, xgb_pred, rf_pred])
