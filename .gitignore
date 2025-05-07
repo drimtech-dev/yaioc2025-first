@@ -2,3 +2,4 @@
 models/
 output.zip
 .DS_Store
+__pycache__
