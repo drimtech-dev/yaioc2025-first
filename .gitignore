@@ -1,4 +1,9 @@
 .idea/
 models/
 output.zip
+<<<<<<< HEAD
 .DS_Store
+=======
+.DS_Store
+__pycache__
+>>>>>>> ml
