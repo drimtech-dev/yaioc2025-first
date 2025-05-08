@@ -1,9 +1,6 @@
-.idea/
-models/
-output.zip
-<<<<<<< HEAD
+.idea
+models
+requirements.txt
 .DS_Store
-=======
-.DS_Store
+.vscode
 __pycache__
->>>>>>> ml
