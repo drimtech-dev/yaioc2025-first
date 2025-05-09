@@ -224,6 +224,22 @@ def train(farm_id):
     # Add time features
     x_df = add_time_features(x_df)
     
+    # Add simple lag features, same as in training
+    lag_features = {}
+    diff_features = {}
+    for col in x_df.columns:
+        if col not in ['hour', 'day', 'month', 'is_daytime', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']:
+            lag_features[f'{col}_lag1'] = x_df[col].shift(1)
+            diff_features[f'{col}_diff'] = x_df[col].diff()
+    
+    # Combine all new features at once using pd.concat
+    lag_df = pd.DataFrame(lag_features, index=x_df.index)
+    diff_df = pd.DataFrame(diff_features, index=x_df.index)
+    x_df = pd.concat([x_df, lag_df, diff_df], axis=1)
+    
+    # Fill NaN values from lag operations
+    x_df = x_df.ffill().bfill()
+    
     y_df = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
     y_df.index = pd.to_datetime(y_df.index)
     y_df.columns = ['power']
@@ -231,33 +247,59 @@ def train(farm_id):
     x_processed, y_processed = data_preprocess(x_df, y_df)
     y_processed[y_processed < 0] = 0
     
+    # Feature selection based on correlation with target (simple but effective)
+    correlations = []
+    for col in x_processed.columns:
+        corr = np.abs(np.corrcoef(x_processed[col], y_processed['power'])[0, 1])
+        if not np.isnan(corr):  # Avoid NaN correlations
+            correlations.append((col, corr))
+    
+    # Sort by correlation and keep top features (70% for wind, 60% for solar)
+    correlations.sort(key=lambda x: x[1], reverse=True)
+    if is_wind_farm:
+        top_features = [col for col, _ in correlations[:int(len(correlations)*0.7)]]
+    else:
+        top_features = [col for col, _ in correlations[:int(len(correlations)*0.6)]]
+    
+    # Keep important time features regardless of correlation
+    for col in x_processed.columns:
+        if any(time_feat in col for time_feat in ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos', 'is_daytime']):
+            if col not in top_features:
+                top_features.append(col)
+    
+    # Use only selected features
+    x_processed = x_processed[top_features]
+    
     # Select the best model based on farm type
     if is_wind_farm:
-        # For wind farms, try GradientBoostingRegressor (more stable than neural networks)
+        # For wind farms, optimize GradientBoostingRegressor parameters
         model = GradientBoostingRegressor(
-            n_estimators=200,
-            learning_rate=0.1,
-            max_depth=5,
+            n_estimators=300,    # Increase from 200
+            learning_rate=0.05,  # Decrease from 0.1 for more stability
+            max_depth=6,         # Slight increase from 5
             min_samples_split=5,
-            min_samples_leaf=2,
+            min_samples_leaf=3,  # Increase from 2 for robustness
             max_features='sqrt',
+            subsample=0.9,       # Add subsampling for better generalization
             random_state=42
         )
         model.fit(x_processed.values, y_processed.values.ravel())
-        return model
+        return model, top_features
     else:
-        # For solar farms, try RandomForestRegressor (handles non-linear relationships well)
+        # For solar farms, optimize RandomForestRegressor parameters
         model = RandomForestRegressor(
-            n_estimators=200,
-            max_depth=10,
-            min_samples_split=5,
+            n_estimators=300,    # Increase from 200
+            max_depth=12,        # Slight increase from 10
+            min_samples_split=4, # Slight decrease from 5
             min_samples_leaf=2,
-            max_features='sqrt',
+            max_features=0.7,    # Use fraction instead of 'sqrt' for better feature coverage
+            bootstrap=True,
+            oob_score=True,      # Use out-of-bag estimation
             n_jobs=-1,
             random_state=42
         )
         model.fit(x_processed.values, y_processed.values.ravel())
-        return model
+        return model, top_features
     
     # Neural network approach (as fallback)
     # Convert to PyTorch tensors
@@ -333,9 +375,9 @@ def train(farm_id):
     
     # Load the best model
     model.load_state_dict(best_model)
-    return model
+    return model, top_features
 
-def predict(model, farm_id):
+def predict(model, farm_id, top_features=None):
     # Determine if wind or solar farm
     is_wind_farm = farm_id <= 5
     
@@ -409,6 +451,30 @@ def predict(model, farm_id):
     # Add time features
     x_df = add_time_features(x_df)
     
+    # Add simple lag features, same as in training
+    lag_features = {}
+    diff_features = {}
+    for col in x_df.columns:
+        if col not in ['hour', 'day', 'month', 'is_daytime', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']:
+            lag_features[f'{col}_lag1'] = x_df[col].shift(1)
+            diff_features[f'{col}_diff'] = x_df[col].diff()
+    
+    # Combine all new features at once using pd.concat
+    lag_df = pd.DataFrame(lag_features, index=x_df.index)
+    diff_df = pd.DataFrame(diff_features, index=x_df.index)
+    x_df = pd.concat([x_df, lag_df, diff_df], axis=1)
+    
+    # Fill NaN values from lag operations
+    x_df = x_df.ffill().bfill()
+    
+    # Use only selected features if provided
+    if top_features:
+        # Ensure all required features exist, create with zeros if missing
+        for feature in top_features:
+            if feature not in x_df.columns:
+                x_df[feature] = 0
+        x_df = x_df[top_features]
+    
     # Make predictions
     if isinstance(model, (GradientBoostingRegressor, RandomForestRegressor)):
         pred_pw = model.predict(x_df.values)
@@ -422,6 +488,35 @@ def predict(model, farm_id):
     # Post-processing for smoother predictions
     pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
     
+    # Apply smoothing with weighted moving average before resampling
+    # This helps reduce noise in predictions while preserving important patterns
+    if is_wind_farm:
+        # Wind power can fluctuate rapidly, use 3-hour window with more weight on central value
+        window_size = 3
+        weights = np.array([0.2, 0.6, 0.2]) # More weight on current hour
+        
+        # Apply smoothing only if we have enough data points
+        if len(pred) >= window_size:
+            smoothed_values = np.convolve(pred.values, weights, mode='same')
+            # Fix the edges (first and last points have no full window)
+            smoothed_values[0] = pred.values[0] * 0.8 + pred.values[1] * 0.2
+            smoothed_values[-1] = pred.values[-2] * 0.2 + pred.values[-1] * 0.8
+            pred = pd.Series(smoothed_values, index=pred.index)
+    else:
+        # Solar power has more regular daily patterns, use slightly larger window
+        window_size = 5
+        weights = np.array([0.1, 0.2, 0.4, 0.2, 0.1]) # More weight on central value
+        
+        # Apply smoothing only if we have enough data points
+        if len(pred) >= window_size:
+            smoothed_values = np.convolve(pred.values, weights, mode='same')
+            # Fix the edges
+            smoothed_values[0] = pred.values[0] * 0.7 + pred.values[1] * 0.3
+            smoothed_values[1] = pred.values[0] * 0.2 + pred.values[1] * 0.5 + pred.values[2] * 0.3
+            smoothed_values[-2] = pred.values[-3] * 0.3 + pred.values[-2] * 0.5 + pred.values[-1] * 0.2
+            smoothed_values[-1] = pred.values[-2] * 0.3 + pred.values[-1] * 0.7
+            pred = pd.Series(smoothed_values, index=pred.index)
+    
     # Apply smoother interpolation for 15min intervals
     res = pred.resample('15min').interpolate(method='cubic')
     
@@ -432,7 +527,6 @@ def predict(model, farm_id):
     # For solar farms, ensure zero production at night
     if not is_wind_farm:
         hours = res.index.hour
-        # More precise night hours definition based on season
         month = res.index.month
         
         # Create masks for different seasons - apply element-wise comparison
@@ -470,15 +564,19 @@ for farm_id in farms:
     model_path = f'models/{farm_id}'
     os.makedirs(model_path, exist_ok=True)
     model_name = 'enhanced_model.pkl'
+    features_name = 'features.pkl'
     
     try:
-        model = train(farm_id)
+        model, top_features = train(farm_id)
         
-        # Save the model
+        # Save the model and selected features
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model, f)
         
-        pred = predict(model, farm_id)
+        with open(os.path.join(model_path, features_name), "wb") as f:
+            pickle.dump(top_features, f)
+        
+        pred = predict(model, farm_id, top_features)
         result_path = f'result/output'
         os.makedirs(result_path, exist_ok=True)
         pred.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
@@ -490,7 +588,4 @@ for farm_id in farms:
         from sklearn.linear_model import LinearRegression
         print(f"Falling back to linear model for farm {farm_id}")
         
-        # Use the original code logic here
-        # ... (fallback implementation)
-
 print('All farms processed')
