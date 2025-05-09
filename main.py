@@ -91,39 +91,38 @@ class CNNModel(nn.Module):
         super(CNNModel, self).__init__()
         self.input_dim = input_dim
         
-        # 创建多尺度卷积层
         self.convs = nn.ModuleList([
             nn.Conv1d(1, num_filters, kernel_size=k, padding=k//2) 
             for k in kernel_sizes
         ])
         
-        # 池化层
-        self.pool = nn.AdaptiveMaxPool1d(1)
+        # Changed MaxPool to AvgPool for potentially more stable pooling
+        self.pool = nn.AdaptiveAvgPool1d(1)
         
-        # 全连接层
-        self.fc = nn.Linear(num_filters * len(kernel_sizes), 128)
-        self.dropout = nn.Dropout(0.2)
-        self.output = nn.Linear(128, 1)
+        # BatchNorm after concatenating features from different conv branches
+        self.bn_concat = nn.BatchNorm1d(num_filters * len(kernel_sizes))
+        
+        self.fc1 = nn.Linear(num_filters * len(kernel_sizes), 128)
+        self.dropout1 = nn.Dropout(0.3) # Slightly increased dropout for regularization
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(128, 1)
         
     def forward(self, x):
         # 重塑为(batch, channels=1, features)
         x = x.unsqueeze(1)
         
-        # 应用卷积层
         conv_results = []
         for conv in self.convs:
-            # 卷积 + ReLU + 池化
             conv_out = torch.relu(conv(x))
             pool_out = self.pool(conv_out).squeeze(-1)
             conv_results.append(pool_out)
         
-        # 连接多尺度特征
         multi_scale = torch.cat(conv_results, dim=1)
+        multi_scale_bn = self.bn_concat(multi_scale) # Apply BatchNorm
         
-        # 全连接层
-        fc_out = torch.relu(self.fc(multi_scale))
-        fc_out = self.dropout(fc_out)
-        return self.output(fc_out)
+        fc_out = self.relu1(self.fc1(multi_scale_bn))
+        fc_out = self.dropout1(fc_out)
+        return self.fc2(fc_out)
     
     def predict(self, X):
         if isinstance(X, np.ndarray):
@@ -1675,10 +1674,10 @@ for farm_id in farms:
         
         # 选择训练方法
         if use_advanced_training:
-            # 使用现有train函数但启用更多模型
-            print("Using enhanced training for high accuracy...")
-            model = train(farm_id)  # 继续使用原有train函数
+            print("Using train_for_high_accuracy for high accuracy goal...")
+            model = train_for_high_accuracy(farm_id)
         else:
+            print("Using standard train function...")
             model = train(farm_id)
         
         # 保存模型
