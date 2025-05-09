@@ -129,7 +129,9 @@ def add_time_features(df):
     return df
 
 def add_wind_features(u_data, v_data, feature_prefix):
-    """Add specialized wind features"""
+    """Add specialized wind features including spatial statistics"""
+    # u_data, v_data are expected to be (num_samples, 9)
+    
     # Wind speed
     ws = np.sqrt(u_data ** 2 + v_data ** 2)
     ws_df = pd.DataFrame(ws, columns=[f"{feature_prefix}_ws_{i}" for i in range(ws.shape[1])])
@@ -142,7 +144,31 @@ def add_wind_features(u_data, v_data, feature_prefix):
     ws_cubed = ws ** 3
     ws_cubed_df = pd.DataFrame(ws_cubed, columns=[f"{feature_prefix}_ws3_{i}" for i in range(ws_cubed.shape[1])])
     
-    return pd.concat([ws_df, wd_df, ws_cubed_df], axis=1)
+    # Spatial statistics across the 9 grid points
+    # For u-component
+    u_mean_df = pd.DataFrame(np.mean(u_data, axis=1), columns=[f"{feature_prefix}_u_mean"])
+    u_std_df = pd.DataFrame(np.std(u_data, axis=1), columns=[f"{feature_prefix}_u_std"])
+    u_min_df = pd.DataFrame(np.min(u_data, axis=1), columns=[f"{feature_prefix}_u_min"])
+    u_max_df = pd.DataFrame(np.max(u_data, axis=1), columns=[f"{feature_prefix}_u_max"])
+    
+    # For v-component
+    v_mean_df = pd.DataFrame(np.mean(v_data, axis=1), columns=[f"{feature_prefix}_v_mean"])
+    v_std_df = pd.DataFrame(np.std(v_data, axis=1), columns=[f"{feature_prefix}_v_std"])
+    v_min_df = pd.DataFrame(np.min(v_data, axis=1), columns=[f"{feature_prefix}_v_min"])
+    v_max_df = pd.DataFrame(np.max(v_data, axis=1), columns=[f"{feature_prefix}_v_max"])
+    
+    # For wind speed (ws)
+    ws_mean_df = pd.DataFrame(np.mean(ws, axis=1), columns=[f"{feature_prefix}_ws_mean"])
+    ws_std_df = pd.DataFrame(np.std(ws, axis=1), columns=[f"{feature_prefix}_ws_std"])
+    ws_min_df = pd.DataFrame(np.min(ws, axis=1), columns=[f"{feature_prefix}_ws_min"])
+    ws_max_df = pd.DataFrame(np.max(ws, axis=1), columns=[f"{feature_prefix}_ws_max"])
+    
+    return pd.concat([
+        ws_df, wd_df, ws_cubed_df,
+        u_mean_df, u_std_df, u_min_df, u_max_df,
+        v_mean_df, v_std_df, v_min_df, v_max_df,
+        ws_mean_df, ws_std_df, ws_min_df, ws_max_df
+    ], axis=1)
 
 def train(farm_id):
     # Determine if wind (1-5) or solar (6-10) farm
@@ -163,21 +189,21 @@ def train(farm_id):
             v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                              channel=['v100']).data.values.reshape(365 * 24, 9)
             
-            # Calculate basic u and v components
+            # Calculate basic u and v components (individual grid points)
             u_df = pd.DataFrame(u, columns=[f"{nwp}_u_{i}" for i in range(u.shape[1])])
             v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
             
-            # Add enhanced wind features
-            wind_features = add_wind_features(u, v, nwp)
+            # Add enhanced wind features (including spatial stats)
+            wind_features_enhanced = add_wind_features(u, v, nwp) # Renamed to avoid clash
             
             # Add turbulence intensity proxy
             if 'tcc' in nwp_data.channel:
-                tcc = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                tcc_wind = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                   channel=['tcc']).data.values.reshape(365 * 24, 9)
-                tcc_df = pd.DataFrame(tcc, columns=[f"{nwp}_tcc_{i}" for i in range(tcc.shape[1])])
-                nwp_df = pd.concat([u_df, v_df, wind_features, tcc_df], axis=1)
+                tcc_wind_df = pd.DataFrame(tcc_wind, columns=[f"{nwp}_tcc_{i}" for i in range(tcc_wind.shape[1])])
+                nwp_df = pd.concat([u_df, v_df, wind_features_enhanced, tcc_wind_df], axis=1)
             else:
-                nwp_df = pd.concat([u_df, v_df, wind_features], axis=1)
+                nwp_df = pd.concat([u_df, v_df, wind_features_enhanced], axis=1)
         else:
             # For solar farms, focus on solar radiation and cloud cover
             if 'ghi' in nwp_data.channel:
@@ -189,33 +215,53 @@ def train(farm_id):
                                    channel=['poai']).data.values.reshape(365 * 24, 9)
                 poai_df = pd.DataFrame(poai, columns=[f"{nwp}_poai_{i}" for i in range(poai.shape[1])])
                 
-                tcc = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                tcc_solar = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                   channel=['tcc']).data.values.reshape(365 * 24, 9)
-                tcc_df = pd.DataFrame(tcc, columns=[f"{nwp}_tcc_{i}" for i in range(tcc.shape[1])])
+                tcc_solar_df = pd.DataFrame(tcc_solar, columns=[f"{nwp}_tcc_{i}" for i in range(tcc_solar.shape[1])])
                 
-                # Calculate average GHI and maximum GHI as additional features
-                avg_ghi = np.mean(ghi, axis=1).reshape(-1, 1)
-                max_ghi = np.max(ghi, axis=1).reshape(-1, 1)
-                avg_ghi_df = pd.DataFrame(avg_ghi, columns=[f"{nwp}_avg_ghi"])
-                max_ghi_df = pd.DataFrame(max_ghi, columns=[f"{nwp}_max_ghi"])
+                # Spatial statistics for GHI
+                ghi_mean_df = pd.DataFrame(np.mean(ghi, axis=1), columns=[f"{nwp}_ghi_mean"])
+                ghi_std_df = pd.DataFrame(np.std(ghi, axis=1), columns=[f"{nwp}_ghi_std"])
+                ghi_min_df = pd.DataFrame(np.min(ghi, axis=1), columns=[f"{nwp}_ghi_min"])
+                ghi_max_df = pd.DataFrame(np.max(ghi, axis=1), columns=[f"{nwp}_ghi_max"]) # Already had this as max_ghi_df
                 
-                # Calculate ratio of actual GHI to clear sky GHI (proxy using max value)
-                # This helps identify cloud effects
-                ghi_ratio = ghi / (max_ghi + 1e-6)
+                # Spatial statistics for POAI
+                poai_mean_df = pd.DataFrame(np.mean(poai, axis=1), columns=[f"{nwp}_poai_mean"])
+                poai_std_df = pd.DataFrame(np.std(poai, axis=1), columns=[f"{nwp}_poai_std"])
+                poai_min_df = pd.DataFrame(np.min(poai, axis=1), columns=[f"{nwp}_poai_min"])
+                poai_max_df = pd.DataFrame(np.max(poai, axis=1), columns=[f"{nwp}_poai_max"])
+                
+                # Spatial statistics for TCC (solar)
+                tcc_solar_mean_df = pd.DataFrame(np.mean(tcc_solar, axis=1), columns=[f"{nwp}_tcc_mean"])
+                tcc_solar_std_df = pd.DataFrame(np.std(tcc_solar, axis=1), columns=[f"{nwp}_tcc_std"])
+                tcc_solar_min_df = pd.DataFrame(np.min(tcc_solar, axis=1), columns=[f"{nwp}_tcc_min"])
+                tcc_solar_max_df = pd.DataFrame(np.max(tcc_solar, axis=1), columns=[f"{nwp}_tcc_max"])
+                
+                # Calculate ratio of actual GHI to clear sky GHI (proxy using max value from grid)
+                ghi_ratio = ghi / (np.max(ghi, axis=1).reshape(-1,1) + 1e-6) # Using max GHI from grid
                 ghi_ratio_df = pd.DataFrame(ghi_ratio, columns=[f"{nwp}_ghi_ratio_{i}" for i in range(ghi_ratio.shape[1])])
                 
-                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, ghi_ratio_df], axis=1)
+                nwp_df = pd.concat([
+                    ghi_df, poai_df, tcc_solar_df, 
+                    ghi_mean_df, ghi_std_df, ghi_min_df, ghi_max_df, # ghi_max_df is duplicated by existing avg_ghi_df/max_ghi_df logic. Will clean up.
+                    poai_mean_df, poai_std_df, poai_min_df, poai_max_df,
+                    tcc_solar_mean_df, tcc_solar_std_df, tcc_solar_min_df, tcc_solar_max_df,
+                    ghi_ratio_df
+                ], axis=1)
+                # Clean up: avg_ghi_df and max_ghi_df from previous version are now covered by ghi_mean_df and ghi_max_df
+
             else:
-                # Fallback to basic features
-                u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                # Fallback to basic features with spatial stats
+                u_fallback = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                 channel=['u100']).data.values.reshape(365 * 24, 9)
-                v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                v_fallback = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                 channel=['v100']).data.values.reshape(365 * 24, 9)
-                u_df = pd.DataFrame(u, columns=[f"{nwp}_u_{i}" for i in range(u.shape[1])])
-                v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
-                ws = np.sqrt(u ** 2 + v ** 2)
-                ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
-                nwp_df = pd.concat([u_df, v_df, ws_df], axis=1)
+                u_fallback_df = pd.DataFrame(u_fallback, columns=[f"{nwp}_u_{i}" for i in range(u_fallback.shape[1])])
+                v_fallback_df = pd.DataFrame(v_fallback, columns=[f"{nwp}_v_{i}" for i in range(v_fallback.shape[1])])
+                
+                # Use add_wind_features for fallback as well to get ws and spatial stats
+                fallback_wind_features = add_wind_features(u_fallback, v_fallback, f"{nwp}_fallback")
+                nwp_df = pd.concat([u_fallback_df, v_fallback_df, fallback_wind_features], axis=1)
         
         x_df = pd.concat([x_df, nwp_df], axis=1)
     
@@ -357,15 +403,15 @@ def predict(model, farm_id):
             v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
             
             # Add enhanced wind features
-            wind_features = add_wind_features(u, v, nwp)
+            wind_features_enhanced = add_wind_features(u, v, nwp)
             
             if 'tcc' in nwp_data.channel:
-                tcc = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                tcc_wind = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                   channel=['tcc']).data.values.reshape(31 * 24, 9)
-                tcc_df = pd.DataFrame(tcc, columns=[f"{nwp}_tcc_{i}" for i in range(tcc.shape[1])])
-                nwp_df = pd.concat([u_df, v_df, wind_features, tcc_df], axis=1)
+                tcc_wind_df = pd.DataFrame(tcc_wind, columns=[f"{nwp}_tcc_{i}" for i in range(tcc_wind.shape[1])])
+                nwp_df = pd.concat([u_df, v_df, wind_features_enhanced, tcc_wind_df], axis=1)
             else:
-                nwp_df = pd.concat([u_df, v_df, wind_features], axis=1)
+                nwp_df = pd.concat([u_df, v_df, wind_features_enhanced], axis=1)
         else:
             if 'ghi' in nwp_data.channel:
                 ghi = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
@@ -376,31 +422,50 @@ def predict(model, farm_id):
                                    channel=['poai']).data.values.reshape(31 * 24, 9)
                 poai_df = pd.DataFrame(poai, columns=[f"{nwp}_poai_{i}" for i in range(poai.shape[1])])
                 
-                tcc = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                tcc_solar = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                   channel=['tcc']).data.values.reshape(31 * 24, 9)
-                tcc_df = pd.DataFrame(tcc, columns=[f"{nwp}_tcc_{i}" for i in range(tcc.shape[1])])
+                tcc_solar_df = pd.DataFrame(tcc_solar, columns=[f"{nwp}_tcc_{i}" for i in range(tcc_solar.shape[1])])
+
+                # Spatial statistics for GHI
+                ghi_mean_df = pd.DataFrame(np.mean(ghi, axis=1), columns=[f"{nwp}_ghi_mean"])
+                ghi_std_df = pd.DataFrame(np.std(ghi, axis=1), columns=[f"{nwp}_ghi_std"])
+                ghi_min_df = pd.DataFrame(np.min(ghi, axis=1), columns=[f"{nwp}_ghi_min"])
+                ghi_max_df = pd.DataFrame(np.max(ghi, axis=1), columns=[f"{nwp}_ghi_max"])
                 
-                # Calculate average GHI and maximum GHI as additional features
-                avg_ghi = np.mean(ghi, axis=1).reshape(-1, 1)
-                max_ghi = np.max(ghi, axis=1).reshape(-1, 1)
-                avg_ghi_df = pd.DataFrame(avg_ghi, columns=[f"{nwp}_avg_ghi"])
-                max_ghi_df = pd.DataFrame(max_ghi, columns=[f"{nwp}_max_ghi"])
+                # Spatial statistics for POAI
+                poai_mean_df = pd.DataFrame(np.mean(poai, axis=1), columns=[f"{nwp}_poai_mean"])
+                poai_std_df = pd.DataFrame(np.std(poai, axis=1), columns=[f"{nwp}_poai_std"])
+                poai_min_df = pd.DataFrame(np.min(poai, axis=1), columns=[f"{nwp}_poai_min"])
+                poai_max_df = pd.DataFrame(np.max(poai, axis=1), columns=[f"{nwp}_poai_max"])
                 
-                # Calculate ratio of actual GHI to clear sky GHI (proxy using max value)
-                ghi_ratio = ghi / (max_ghi + 1e-6)
+                # Spatial statistics for TCC (solar)
+                tcc_solar_mean_df = pd.DataFrame(np.mean(tcc_solar, axis=1), columns=[f"{nwp}_tcc_mean"])
+                tcc_solar_std_df = pd.DataFrame(np.std(tcc_solar, axis=1), columns=[f"{nwp}_tcc_std"])
+                tcc_solar_min_df = pd.DataFrame(np.min(tcc_solar, axis=1), columns=[f"{nwp}_tcc_min"])
+                tcc_solar_max_df = pd.DataFrame(np.max(tcc_solar, axis=1), columns=[f"{nwp}_tcc_max"])
+                                
+                # Calculate ratio of actual GHI to clear sky GHI (proxy using max value from grid)
+                ghi_ratio = ghi / (np.max(ghi, axis=1).reshape(-1,1) + 1e-6)
                 ghi_ratio_df = pd.DataFrame(ghi_ratio, columns=[f"{nwp}_ghi_ratio_{i}" for i in range(ghi_ratio.shape[1])])
                 
-                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, ghi_ratio_df], axis=1)
+                nwp_df = pd.concat([
+                    ghi_df, poai_df, tcc_solar_df, 
+                    ghi_mean_df, ghi_std_df, ghi_min_df, ghi_max_df,
+                    poai_mean_df, poai_std_df, poai_min_df, poai_max_df,
+                    tcc_solar_mean_df, tcc_solar_std_df, tcc_solar_min_df, tcc_solar_max_df,
+                    ghi_ratio_df
+                ], axis=1)
             else:
-                u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                # Fallback to basic features with spatial stats
+                u_fallback = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                 channel=['u100']).data.values.reshape(31 * 24, 9)
-                v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                v_fallback = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                 channel=['v100']).data.values.reshape(31 * 24, 9)
-                u_df = pd.DataFrame(u, columns=[f"{nwp}_u_{i}" for i in range(u.shape[1])])
-                v_df = pd.DataFrame(v, columns=[f"{nwp}_v_{i}" for i in range(v.shape[1])])
-                ws = np.sqrt(u ** 2 + v ** 2)
-                ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
-                nwp_df = pd.concat([u_df, v_df, ws_df], axis=1)
+                u_fallback_df = pd.DataFrame(u_fallback, columns=[f"{nwp}_u_{i}" for i in range(u_fallback.shape[1])])
+                v_fallback_df = pd.DataFrame(v_fallback, columns=[f"{nwp}_v_{i}" for i in range(v_fallback.shape[1])])
+                
+                fallback_wind_features = add_wind_features(u_fallback, v_fallback, f"{nwp}_fallback")
+                nwp_df = pd.concat([u_fallback_df, v_fallback_df, fallback_wind_features], axis=1)
         
         x_df = pd.concat([x_df, nwp_df], axis=1)
     
