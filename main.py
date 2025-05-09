@@ -224,15 +224,20 @@ def train(farm_id):
     # Add time features
     x_df = add_time_features(x_df)
     
-    # Add simple lag features for better time series modeling
-    # These capture recent trends without adding too much complexity
+    # Add simple lag features, same as in training
+    lag_features = {}
+    diff_features = {}
     for col in x_df.columns:
         if col not in ['hour', 'day', 'month', 'is_daytime', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']:
-            x_df[f'{col}_lag1'] = x_df[col].shift(1)
-            # Also add a rate of change feature
-            x_df[f'{col}_diff'] = x_df[col].diff()
+            lag_features[f'{col}_lag1'] = x_df[col].shift(1)
+            diff_features[f'{col}_diff'] = x_df[col].diff()
     
-    # Fill NaN values from lag/diff operations
+    # Combine all new features at once using pd.concat
+    lag_df = pd.DataFrame(lag_features, index=x_df.index)
+    diff_df = pd.DataFrame(diff_features, index=x_df.index)
+    x_df = pd.concat([x_df, lag_df, diff_df], axis=1)
+    
+    # Fill NaN values from lag operations
     x_df = x_df.ffill().bfill()
     
     y_df = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
@@ -447,10 +452,17 @@ def predict(model, farm_id, top_features=None):
     x_df = add_time_features(x_df)
     
     # Add simple lag features, same as in training
+    lag_features = {}
+    diff_features = {}
     for col in x_df.columns:
         if col not in ['hour', 'day', 'month', 'is_daytime', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']:
-            x_df[f'{col}_lag1'] = x_df[col].shift(1)
-            x_df[f'{col}_diff'] = x_df[col].diff()
+            lag_features[f'{col}_lag1'] = x_df[col].shift(1)
+            diff_features[f'{col}_diff'] = x_df[col].diff()
+    
+    # Combine all new features at once using pd.concat
+    lag_df = pd.DataFrame(lag_features, index=x_df.index)
+    diff_df = pd.DataFrame(diff_features, index=x_df.index)
+    x_df = pd.concat([x_df, lag_df, diff_df], axis=1)
     
     # Fill NaN values from lag operations
     x_df = x_df.ffill().bfill()
@@ -515,6 +527,8 @@ def predict(model, farm_id, top_features=None):
     # For solar farms, ensure zero production at night
     if not is_wind_farm:
         hours = res.index.hour
+        month = res.index.month
+        
         # Create masks for different seasons - apply element-wise comparison
         winter_mask = month.isin([11, 12, 1, 2])
         summer_mask = month.isin([5, 6, 7, 8])
@@ -574,7 +588,4 @@ for farm_id in farms:
         from sklearn.linear_model import LinearRegression
         print(f"Falling back to linear model for farm {farm_id}")
         
-        # Use the original code logic here
-        # ... (fallback implementation)
-
 print('All farms processed')
