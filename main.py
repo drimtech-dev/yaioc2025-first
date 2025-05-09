@@ -656,6 +656,383 @@ def train_model(model, X_train, y_train, X_val, y_val, is_wind_farm=True, num_ep
     
     return model, final_val_acc
 
+# ========== 高级模型和特征工程扩展（0.9准确率目标）==========
+
+# 双向LSTM模型，捕捉更复杂的时间依赖关系
+class BiLSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.2):
+        super(BiLSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
+                           batch_first=True, bidirectional=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim * 2, 64)  # *2因为是双向
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(64, 1)
+        
+    def forward(self, x):
+        # 重塑为序列形式 (batch, seq=1, features)
+        x = x.unsqueeze(1)
+        lstm_out, _ = self.lstm(x)
+        # 取最后一个时间步的输出
+        fc_out = self.fc(lstm_out.squeeze(1))
+        fc_out = torch.relu(fc_out)
+        fc_out = self.dropout(fc_out)
+        return self.out(fc_out)
+    
+    def predict(self, X):
+        if isinstance(X, np.ndarray):
+            X = torch.tensor(X, dtype=torch.float32)
+        self.eval()
+        with torch.no_grad():
+            return self(X).numpy()
+
+# ResNet风格残差网络，防止梯度消失并提高复杂模式学习能力
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Linear(in_features, in_features),
+            nn.BatchNorm1d(in_features),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(in_features, in_features),
+            nn.BatchNorm1d(in_features)
+        )
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        residual = x
+        out = self.block(x)
+        out += residual  # 残差连接
+        return self.relu(out)
+
+class ResNetModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_blocks=3):
+        super(ResNetModel, self).__init__()
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU()
+        )
+        
+        # 残差块
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim) for _ in range(num_blocks)
+        ])
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1)
+        )
+        
+    def forward(self, x):
+        x = self.input_layer(x)
+        for block in self.res_blocks:
+            x = block(x)
+        return self.output_layer(x)
+    
+    def predict(self, X):
+        if isinstance(X, np.ndarray):
+            X = torch.tensor(X, dtype=torch.float32)
+        self.eval()
+        with torch.no_grad():
+            return self(X).numpy()
+
+# 自适应加权集成模型 - 根据时间和特征条件动态调整模型权重
+class AdaptiveEnsembleModel(nn.Module): # Inherit from nn.Module for consistency if it might be saved like other torch models
+    def __init__(self, models, base_weights=None):
+        super(AdaptiveEnsembleModel, self).__init__() # Add super init
+        self.models = nn.ModuleList(models) # Store models in ModuleList
+        # 设置基础权重，如果未提供则平均分配
+        if base_weights is None:
+            self.base_weights = nn.Parameter(torch.ones(len(models)) / len(models), requires_grad=False)
+        else:
+            # 确保权重总和为1
+            self.base_weights = nn.Parameter(torch.tensor(np.array(base_weights) / np.sum(base_weights), dtype=torch.float32), requires_grad=False)
+        
+    def predict(self, X_np, time_features=None): # Changed X to X_np for clarity as it's numpy
+        """动态加权预测
+        
+        Args:
+            X_np: 输入特征 (numpy array)
+            time_features: 包含时间信息的字典(小时、月份等)
+        """
+        # 收集每个模型的预测
+        predictions = []
+        
+        # Convert X_np to tensor for PyTorch models if not already handled by SklearnModelWrapper
+        # This part assumes X_np is the direct input for predict
+        # SklearnModelWrapper handles numpy input internally.
+        # PyTorch models in the ensemble need tensor input.
+        X_tensor_for_torch_models = torch.tensor(X_np, dtype=torch.float32)
+
+        for model_idx, model in enumerate(self.models):
+            if isinstance(model, SklearnModelWrapper):
+                pred = model.predict(X_np) # Sklearn models take numpy
+            else: # PyTorch model
+                model.eval()
+                with torch.no_grad():
+                    pred = model(X_tensor_for_torch_models).cpu().numpy()
+            predictions.append(pred.flatten())
+        
+        # 使用基础权重副本 (convert parameter to numpy for manipulation)
+        current_weights = self.base_weights.detach().cpu().numpy().copy()
+        
+        # 根据时间或其他特征动态调整权重
+        if time_features is not None:
+            hour = time_features.get('hour', None)
+            month = time_features.get('month', None)
+            
+            # 根据一天中的时间调整
+            if hour is not None:
+                # Ensure hour is an array for consistent processing
+                hour_array = np.array(hour) if isinstance(hour, (int, float)) else hour
+                
+                for i in range(len(X_np)): # Iterate over batch dimension
+                    h = hour_array[i] if len(hour_array) > 1 else hour_array[0]
+                    # Example: Deep learning models (first 3) better during day, tree models (next) more reliable otherwise
+                    # This logic needs to be robust to the number of models and their types.
+                    # Assuming first N models are DL, rest are tree/other. This is fragile.
+                    # A better approach might be to tag models or use their class types.
+                    if 8 <= h <= 16:  # 白天
+                        for j in range(min(3, len(current_weights))): # Adapt based on actual model types
+                             current_weights[j] *= 1.2 
+                    else:  # 夜晚/早晨/傍晚
+                        for j in range(min(3, len(current_weights)), len(current_weights)): # Adapt
+                             current_weights[j] *= 1.2
+            
+            # 根据季节调整 (Simplified logic, apply uniformly if single value)
+            if month is not None:
+                month_val = month[0] if isinstance(month, np.ndarray) and len(month)>0 else month # Take first if array
+                if isinstance(month_val, (int, float)):
+                    if 3 <= month_val <= 5: current_weights[0 % len(current_weights)] *= 1.2
+                    elif 6 <= month_val <= 8: current_weights[1 % len(current_weights)] *= 1.2
+                    elif 9 <= month_val <= 11: current_weights[2 % len(current_weights)] *= 1.2
+                    else: current_weights[3 % len(current_weights)] *= 1.2
+        
+        # 重新归一化权重
+        current_weights = current_weights / np.sum(current_weights)
+        
+        # 加权组合预测结果
+        predictions_np = np.vstack(predictions) # predictions are already numpy arrays
+        weighted_pred = np.sum(predictions_np.T * current_weights, axis=1).reshape(-1, 1)
+        
+        return weighted_pred
+
+# 高级特征提取：针对可再生能源物理模型优化
+def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365):
+    """增强版特征提取，融合物理模型和工程经验"""
+    # 获取基本特征
+    features_dict = extract_features(nwp_data, is_wind_farm, num_days) # Assuming extract_features is defined
+    
+    # 添加风能和太阳能发电的专业物理特征
+    if is_wind_farm:
+        ws = features_dict['ws']
+        cut_in = 3.0; rated = 12.0; cut_out = 25.0
+        power_curve = np.zeros_like(ws)
+        # Vectorized approach for power curve
+        idx_below_cut_in = ws < cut_in
+        idx_ramp = (ws >= cut_in) & (ws < rated)
+        idx_rated_power = (ws >= rated) & (ws < cut_out)
+        
+        power_curve[idx_below_cut_in] = 0
+        power_curve[idx_ramp] = ((ws[idx_ramp] - cut_in) / (rated - cut_in))**3
+        power_curve[idx_rated_power] = 1.0
+        # ws >= cut_out remains 0 (default)
+        features_dict['power_curve_approx'] = power_curve
+        
+        ws_std = np.std(ws, axis=1, keepdims=True)
+        ws_mean = np.mean(ws, axis=1, keepdims=True)
+        features_dict['turbulence_intensity'] = ws_std / (ws_mean + 1e-8)
+    
+    else: # Solar
+        if 'ghi' in features_dict and 't2m' in features_dict:
+            ghi = features_dict['ghi']; t2m = features_dict['t2m']
+            t2m_celsius = t2m - 273.15
+            nominal_operating_temp = 45
+            # Vectorized panel temperature calculation
+            panel_temp = t2m_celsius + (nominal_operating_temp - 20) / 800 * ghi
+            features_dict['panel_temperature'] = panel_temp
+            
+            temp_coeff = -0.004
+            temp_factor = 1 + temp_coeff * (panel_temp - 25)
+            features_dict['temp_efficiency_factor'] = temp_factor
+            features_dict['physics_power_estimate'] = ghi * temp_factor
+    
+    for key in list(features_dict.keys()):
+        feature_array = features_dict[key]
+        if isinstance(feature_array, np.ndarray) and feature_array.ndim > 1:
+            if np.all(feature_array >= 0):
+                features_dict[f'{key}_log'] = np.log1p(feature_array)
+    
+    if 'ws' in features_dict and 't2m' in features_dict:
+        features_dict['ws_t2m_interaction'] = features_dict['ws'] * features_dict['t2m']
+    
+    return features_dict
+
+# 高级数据预处理：时空数据清洗和增强
+def advanced_preprocess(x_df, y_df, is_wind_farm=True):
+    """专门针对可再生能源的高级数据预处理"""
+    x_df = x_df.dropna()
+    y_df = y_df.dropna()
+    common_idx = x_df.index.intersection(y_df.index)
+    x_df = x_df.loc[common_idx]; y_df = y_df.loc[common_idx]
+    
+    hour = x_df.index.hour
+    if not is_wind_farm:
+        y_df.loc[(hour < 6) | (hour > 19)] = 0
+    
+    if is_wind_farm and 'ws_mean' in x_df.columns: # Check if ws_mean was created by a specific feature extractor
+        ws_mean_series = x_df['ws_mean'] # Potentially problematic if ws_mean is multi-dim
+        if ws_mean_series.ndim == 1:
+             y_df.loc[(ws_mean_series < 2.5) | (ws_mean_series > 25)] *= 0.5
+    
+    for col in y_df.columns:
+        values = y_df[col].values
+        q25 = np.percentile(values, 25); q75 = np.percentile(values, 75)
+        iqr = q75 - q25
+        lower_bound = q25 - 3 * iqr; upper_bound = q75 + 3 * iqr
+        outliers = (values < lower_bound) | (values > upper_bound)
+        if np.any(outliers):
+            median_values = y_df[col].rolling(window=24, center=True, min_periods=1).median()
+            # Ensure indices match for assignment
+            y_df.loc[y_df.index[outliers], col] = median_values.loc[y_df.index[outliers]]
+
+
+    y_df = y_df.clip(0, 1)
+    return x_df, y_df
+
+# 用于0.9准确率的训练函数
+def train_for_high_accuracy(farm_id):
+    """追求超高准确率的训练函数，使用高级特征和集成策略"""
+    is_wind_farm = farm_id <= 5
+    print(f"Training {'wind' if is_wind_farm else 'solar'} farm {farm_id} for high accuracy")
+    
+    x_df_full = pd.DataFrame()
+    nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
+    for nwp in nwps:
+        nwp_path = os.path.join(nwp_train_path, nwp)
+        nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
+        features_dict = enhanced_extract_features(nwp_data, is_wind_farm, num_days=365)
+        nwp_df = create_feature_dataframe(features_dict, nwp) # Assuming this is defined
+        x_df_full = pd.concat([x_df_full, nwp_df], axis=1)
+    
+    x_df_full.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
+    x_df_full = add_time_features(x_df_full) # Assuming this is defined
+    
+    y_df_full = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
+    y_df_full.index = pd.to_datetime(y_df_full.index)
+    y_df_full.columns = ['power']
+    
+    x_processed, y_processed = advanced_preprocess(x_df_full, y_df_full, is_wind_farm)
+    
+    if x_processed.shape[1] > 100:
+        print(f"特征选择: 从 {x_processed.shape[1]} 个特征中筛选...")
+        # Ensure y_sample is 1D for RandomForestRegressor
+        y_sample_1d = y_processed.values[:min(10000, len(y_processed))].ravel() 
+        X_sample = x_processed.values[:min(10000, len(x_processed))]
+        
+        rf_selector = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf_selector.fit(X_sample, y_sample_1d)
+        importances = rf_selector.feature_importances_
+        indices = np.argsort(importances)[::-1]
+        cum_importance = np.cumsum(importances[indices])
+        num_features = np.where(cum_importance >= 0.95)[0][0] + 1
+        selected_feature_names = list(x_processed.columns[indices[:num_features]])
+        print(f"选择了 {len(selected_feature_names)} 个重要特征")
+        x_processed = x_processed[selected_feature_names]
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(x_processed.values)
+    
+    train_size = int(0.7 * len(X_scaled)); val_size = int(0.15 * len(X_scaled))
+    X_train_pt = torch.tensor(X_scaled[:train_size], dtype=torch.float32)
+    y_train_pt = torch.tensor(y_processed.values[:train_size], dtype=torch.float32)
+    X_val_pt = torch.tensor(X_scaled[train_size:train_size+val_size], dtype=torch.float32)
+    y_val_pt = torch.tensor(y_processed.values[train_size:train_size+val_size], dtype=torch.float32)
+    # X_test_pt for a final hold-out, if needed for reporting, but not used for model saving/selection here
+    # X_test_pt = torch.tensor(X_scaled[train_size+val_size:], dtype=torch.float32)
+    # y_test_pt = torch.tensor(y_processed.values[train_size+val_size:], dtype=torch.float32)
+
+    input_dim = X_train_pt.shape[1]
+    model_definitions = [
+        ("linear", LinearModel(input_dim)), ("mlp_small", MLPModel(input_dim, [64, 32])),
+        ("mlp_large", MLPModel(input_dim, [256, 128, 64])), ("lstm", LSTMModel(input_dim, hidden_dim=128)),
+        ("bilstm", BiLSTMModel(input_dim, hidden_dim=128)), ("resnet", ResNetModel(input_dim, hidden_dim=128)),
+        ("cnn", CNNModel(input_dim))
+    ]
+    
+    X_train_np = X_train_pt.numpy(); y_train_np_flat = y_train_pt.numpy().flatten()
+    X_val_np = X_val_pt.numpy(); y_val_np_flat = y_val_pt.numpy().flatten()
+
+    model_results = {}
+    
+    for name, model_obj in model_definitions:
+        print(f"训练 {name} 模型...")
+        try:
+            # train_model is assumed to be defined elsewhere and handles PyTorch models
+            trained_m, val_acc = train_model(model_obj, X_train_pt, y_train_pt, X_val_pt, y_val_pt, is_wind_farm=is_wind_farm, num_epochs=300)
+            model_results[name] = (trained_m, val_acc)
+            print(f"{name} 验证准确率: {val_acc:.4f}")
+        except Exception as e: print(f"训练 {name} 时出错: {str(e)}")
+
+    # Train Sklearn models
+    sklearn_models_def = {
+        "random_forest": RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42),
+        "gradient_boosting": GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42)
+    }
+    for name, model_sk in sklearn_models_def.items():
+        print(f"训练 {name} 模型...")
+        try:
+            model_sk.fit(X_train_np, y_train_np_flat)
+            val_pred_sk = model_sk.predict(X_val_np)
+            val_acc_sk = calculate_accuracy(y_val_np_flat, val_pred_sk) # calculate_accuracy defined elsewhere
+            model_results[name] = (SklearnModelWrapper(model_sk), val_acc_sk) # Wrap for consistent interface
+            print(f"{name} 验证准确率: {val_acc_sk:.4f}")
+        except Exception as e: print(f"训练 {name} 时出错: {str(e)}")
+
+    print("\\n模型性能总结:")
+    # Sort by accuracy (descending)
+    sorted_results = sorted(model_results.items(), key=lambda item: item[1][1], reverse=True)
+    for name, (model_inst, acc) in sorted_results:
+        print(f"模型: {name}, 准确率: {acc:.4f}")
+    
+    if not sorted_results:
+        print("No models trained successfully. Cannot create ensemble.")
+        return None
+
+    print("\\n创建自适应集成模型...")
+    top_n = min(5, len(sorted_results))
+    top_models_for_ensemble = [res[1][0] for res in sorted_results[:top_n]] # Get actual model instances
+    top_accuracies_for_weights = [res[1][1] for res in sorted_results[:top_n]]
+    
+    # Ensure AdaptiveEnsembleModel is correctly instantiated and used
+    # The AdaptiveEnsembleModel definition used here should be the nn.Module one if saving the whole ensemble
+    ensemble_model = AdaptiveEnsembleModel(top_models_for_ensemble, base_weights=top_accuracies_for_weights)
+    
+    # Store metadata for prediction phase
+    ensemble_model.scaler = scaler
+    # Ensure feature_columns are from the potentially reduced set after feature selection
+    ensemble_model.feature_columns = list(x_processed.columns) 
+    ensemble_model.is_wind_farm = is_wind_farm
+    ensemble_model.model_names_in_ensemble = [res[0] for res in sorted_results[:top_n]]
+
+    # Evaluate ensemble on validation set
+    # Prepare time features for validation set
+    val_indices = x_df_full.index.intersection(x_processed.index[train_size:train_size+val_size])
+    time_features_val = {
+        'hour': x_df_full.loc[val_indices]['hour'].values if 'hour' in x_df_full.columns else None,
+        'month': x_df_full.loc[val_indices]['month'].values if 'month' in x_df_full.columns else None
+    }
+    
+    # AdaptiveEnsembleModel.predict expects numpy array
+    ensemble_val_pred_np = ensemble_model.predict(X_val_np, time_features_val).flatten()
+    ensemble_val_acc = calculate_accuracy(y_val_np_flat, ensemble_val_pred_np)
+    print(f"集成模型验证准确率: {ensemble_val_acc:.4f}")
+        
+    return ensemble_model
+
 def train(farm_id):
     # 确定风电场或太阳能电场
     is_wind_farm = farm_id <= 5
@@ -1367,7 +1744,7 @@ def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365, hour_of
             # NOCT通常为42-48°C
             NOCT = 45  # 标称工作温度
             panel_temp = t2m_celsius + (NOCT - 20)/800 * ghi
-            features_dict['panel_temp'] = panel_temp
+            features_dict['panel_temperature'] = panel_temp
             
             # 温度修正的功率输出因子
             # 典型的温度系数为 -0.4%/°C
@@ -1842,507 +2219,6 @@ for farm_id in farms:
 
     print('All farms processed')
 
-# ========== 高级模型和特征工程扩展（0.9准确率目标）==========
-
-# 双向LSTM模型，捕捉更复杂的时间依赖关系
-class BiLSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.2):
-        super(BiLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
-                           batch_first=True, bidirectional=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim * 2, 64)  # *2因为是双向
-        self.dropout = nn.Dropout(dropout)
-        self.out = nn.Linear(64, 1)
-        
-    def forward(self, x):
-        # 重塑为序列形式 (batch, seq=1, features)
-        x = x.unsqueeze(1)
-        lstm_out, _ = self.lstm(x)
-        # 取最后一个时间步的输出
-        fc_out = self.fc(lstm_out.squeeze(1))
-        fc_out = torch.relu(fc_out)
-        fc_out = self.dropout(fc_out)
-        return self.out(fc_out)
-    
-    def predict(self, X):
-        if isinstance(X, np.ndarray):
-            X = torch.tensor(X, dtype=torch.float32)
-        self.eval()
-        with torch.no_grad():
-            return self(X).numpy()
-
-# ResNet风格残差网络，防止梯度消失并提高复杂模式学习能力
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Linear(in_features, in_features),
-            nn.BatchNorm1d(in_features),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(in_features, in_features),
-            nn.BatchNorm1d(in_features)
-        )
-        self.relu = nn.ReLU()
-        
-    def forward(self, x):
-        residual = x
-        out = self.block(x)
-        out += residual  # 残差连接
-        return self.relu(out)
-
-class ResNetModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_blocks=3):
-        super(ResNetModel, self).__init__()
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU()
-        )
-        
-        # 残差块
-        self.res_blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim) for _ in range(num_blocks)
-        ])
-        
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 1)
-        )
-        
-    def forward(self, x):
-        x = self.input_layer(x)
-        for block in self.res_blocks:
-            x = block(x)
-        return self.output_layer(x)
-    
-    def predict(self, X):
-        if isinstance(X, np.ndarray):
-            X = torch.tensor(X, dtype=torch.float32)
-        self.eval()
-        with torch.no_grad():
-            return self(X).numpy()
-
-# 自适应加权集成模型 - 根据时间和特征条件动态调整模型权重
-class AdaptiveEnsembleModel:
-    def __init__(self, models, base_weights=None):
-        self.models = models
-        # 设置基础权重，如果未提供则平均分配
-        if base_weights is None:
-            self.base_weights = np.ones(len(models)) / len(models)
-        else:
-            # 确保权重总和为1
-            self.base_weights = np.array(base_weights) / np.sum(base_weights)
-        
-    def predict(self, X, time_features=None):
-        """动态加权预测
-        
-        Args:
-            X: 输入特征
-            time_features: 包含时间信息的字典(小时、月份等)
-        """
-        # 收集每个模型的预测
-        predictions = []
-        for model in self.models:
-            if isinstance(X, np.ndarray):
-                X_tensor = torch.tensor(X, dtype=torch.float32)
-                if hasattr(model, 'eval'):
-                    model.eval()
-                if isinstance(model, SklearnModelWrapper):
-                    pred = model.predict(X)
-                else:
-                    with torch.no_grad():
-                        pred = model(X_tensor).cpu().numpy()
-            else:
-                pred = model.predict(X)
-            predictions.append(pred.flatten())
-        
-        # 使用基础权重副本
-        weights = self.base_weights.copy()
-        
-        # 根据时间或其他特征动态调整权重
-        if time_features is not None:
-            hour = time_features.get('hour', None)
-            month = time_features.get('month', None)
-            
-            # 根据一天中的时间调整
-            if hour is not None:
-                # 示例：深度学习模型在白天表现更好，树模型在夜晚更可靠
-                if isinstance(hour, (int, float)):
-                    # 单个值
-                    if 8 <= hour <= 16:  # 白天
-                        weights[0:3] *= 1.2  # 增加神经网络模型权重
-                    else:  # 夜晚/早晨/傍晚
-                        weights[3:] *= 1.2  # 增加树模型权重
-                else:
-                    # 数组值
-                    for i, h in enumerate(hour):
-                        if 8 <= h <= 16:
-                            for j in range(min(3, len(weights))):
-                                weights[j] *= 1.2
-                        else:
-                            for j in range(3, len(weights)):
-                                weights[j] *= 1.2
-            
-            # 根据季节调整
-            if month is not None:
-                # 示例：不同季节调整权重
-                if isinstance(month, (int, float)):
-                    # 春夏秋冬不同模型表现不同
-                    if 3 <= month <= 5:  # 春季
-                        weights[0] *= 1.2  # 假设第一个模型在春季表现更好
-                    elif 6 <= month <= 8:  # 夏季
-                        weights[1] *= 1.2  # 假设第二个模型在夏季表现更好
-                    elif 9 <= month <= 11:  # 秋季
-                        weights[2] *= 1.2
-                    else:  # 冬季
-                        weights[3] *= 1.2
-        
-        # 重新归一化权重
-        weights = weights / np.sum(weights)
-        
-        # 加权组合预测结果
-        predictions = np.vstack(predictions)
-        weighted_pred = np.sum(predictions.T * weights, axis=1).reshape(-1, 1)
-        
-        return weighted_pred
-
-# 高级特征提取：针对可再生能源物理模型优化
-def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365):
-    """增强版特征提取，融合物理模型和工程经验"""
-    # 获取基本特征
-    features_dict = extract_features(nwp_data, is_wind_farm, num_days)
-    
-    # 添加风能和太阳能发电的专业物理特征
-    if is_wind_farm:
-        # 风电专有物理模型特征
-        ws = features_dict['ws']  # 风速
-        
-        # 风力机功率曲线建模（简化）
-        # 典型风力机参数
-        cut_in = 3.0    # 启动风速 (m/s)
-        rated = 12.0    # 额定风速 (m/s)
-        cut_out = 25.0  # 切出风速 (m/s)
-        
-        # 创建风机功率曲线近似
-        power_curve = np.zeros_like(ws)
-        for i in range(ws.shape[0]):
-            for j in range(ws.shape[1]):
-                v = ws[i, j]
-                if v < cut_in:
-                    power_curve[i, j] = 0
-                elif v < rated:
-                    # 启动到额定之间是非线性增长，通常与v³成比例
-                    power_curve[i, j] = ((v - cut_in) / (rated - cut_in))**3
-                elif v < cut_out:
-                    power_curve[i, j] = 1.0  # 额定功率
-                else:
-                    power_curve[i, j] = 0  # 大风保护停机
-        
-        features_dict['power_curve_approx'] = power_curve
-        
-        # 湍流强度：风速标准差/平均风速
-        ws_std = np.std(ws, axis=1).reshape(-1, 1)
-        ws_mean = np.mean(ws, axis=1).reshape(-1, 1)
-        turbulence = ws_std / (ws_mean + 1e-8)  # 避免除零
-        features_dict['turbulence_intensity'] = turbulence
-    
-    else:
-        # 太阳能专有物理模型特征
-        if 'ghi' in features_dict and 't2m' in features_dict:
-            ghi = features_dict['ghi']
-            t2m = features_dict['t2m']
-            
-            # 太阳能板温度估计 (使用NOCT方法)
-            t2m_celsius = t2m - 273.15  # 开尔文转摄氏度
-            nominal_operating_temp = 45  # 典型NOCT值
-            
-            # 板温 = 环境温度 + (NOCT-20)/800 * 辐照度
-            panel_temp = np.zeros_like(ghi)
-            for i in range(ghi.shape[0]):
-                for j in range(ghi.shape[1]):
-                    panel_temp[i, j] = t2m_celsius[i, j] + (nominal_operating_temp - 20) / 800 * ghi[i, j]
-            
-            features_dict['panel_temperature'] = panel_temp
-            
-            # 温度修正的效率因子
-            # 典型的结晶硅电池温度系数约为 -0.4%/°C
-            temp_coeff = -0.004
-            temp_factor = 1 + temp_coeff * (panel_temp - 25)  # 相对于25°C
-            features_dict['temp_efficiency_factor'] = temp_factor
-            
-            # 结合辐照和温度效率的功率估计
-            power_estimate = ghi * temp_factor
-            features_dict['physics_power_estimate'] = power_estimate
-    
-    # 非线性变换：捕捉复杂关系
-    for key in list(features_dict.keys()):
-        if isinstance(features_dict[key], np.ndarray) and features_dict[key].ndim > 1:
-            # 对非负值特征应用对数变换
-            if np.all(features_dict[key] >= 0):
-                # log(x+1)变换，保留零值
-                log_feature = np.log1p(features_dict[key])
-                features_dict[f'{key}_log'] = log_feature
-    
-    # 特征交互：重要特征的组合可能捕捉到额外信息
-    if 'ws' in features_dict and 't2m' in features_dict:
-        ws = features_dict['ws']
-        t2m = features_dict['t2m']
-        # 风速与温度交互项可能影响发电效率
-        features_dict['ws_t2m_interaction'] = ws * t2m
-    
-    return features_dict
-
-# 高级数据预处理：时空数据清洗和增强
-def advanced_preprocess(x_df, y_df, is_wind_farm=True):
-    """专门针对可再生能源的高级数据预处理"""
-    # 基本对齐和清洗
-    x_df = x_df.dropna()
-    y_df = y_df.dropna()
-    common_idx = x_df.index.intersection(y_df.index)
-    x_df = x_df.loc[common_idx]
-    y_df = y_df.loc[common_idx]
-    
-    # 特殊时间段处理
-    hour = x_df.index.hour
-    
-    # 太阳能夜间处理
-    if not is_wind_farm:
-        # 确保太阳能夜间输出为0
-        night_mask = (hour < 6) | (hour > 19)
-        y_df.loc[night_mask] = 0
-    
-    # 风电场极端风速处理
-    if is_wind_farm and 'ws_mean' in x_df.columns:
-        ws_mean = x_df['ws_mean'].values
-        # 风速过高或过低时发电量应该很小
-        extreme_wind = (ws_mean < 2.5) | (ws_mean > 25)
-        # 不直接设零，而是给这些区域更小的权重
-        extreme_weight = 0.5
-        y_df.loc[extreme_wind] *= extreme_weight
-    
-    # 异常值检测和修复
-    for col in y_df.columns:
-        values = y_df[col].values
-        q25 = np.percentile(values, 25)
-        q75 = np.percentile(values, 75)
-        iqr = q75 - q25
-        
-        # IQR方法检测异常
-        lower_bound = q25 - 3 * iqr
-        upper_bound = q75 + 3 * iqr
-        
-        outliers = (values < lower_bound) | (values > upper_bound)
-        if np.any(outliers):
-            # 使用移动中位数替换异常值
-            window = 24  # 24小时窗口
-            median_values = y_df[col].rolling(window=window, center=True, min_periods=1).median()
-            y_df.loc[outliers, col] = median_values[outliers]
-    
-    # 确保数值在有效范围内
-    y_df = y_df.clip(0, 1)
-    
-    return x_df, y_df
-
-# 用于0.9准确率的训练函数
-def train_for_high_accuracy(farm_id):
-    """追求超高准确率的训练函数，使用高级特征和集成策略"""
-    # 基本设置
-    is_wind_farm = farm_id <= 5
-    print(f"Training {'wind' if is_wind_farm else 'solar'} farm {farm_id} for high accuracy")
-    
-    # 准备训练数据
-    x_df = pd.DataFrame()
-    nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
-    
-    # 收集所有气象数据源
-    for nwp in nwps:
-        nwp_path = os.path.join(nwp_train_path, nwp)
-        nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
-        
-        # 使用增强特征提取
-        features_dict = enhanced_extract_features(nwp_data, is_wind_farm, num_days=365)
-        nwp_df = create_feature_dataframe(features_dict, nwp)
-        x_df = pd.concat([x_df, nwp_df], axis=1)
-    
-    x_df.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
-    
-    # 高级时间特征
-    x_df = add_time_features(x_df)
-    
-    # 加载目标数据
-    y_df = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
-    y_df.index = pd.to_datetime(y_df.index)
-    y_df.columns = ['power']
-    
-    # 高级数据预处理
-    x_processed, y_processed = advanced_preprocess(x_df, y_df, is_wind_farm)
-    
-    # 筛选最重要特征
-    # 使用随机森林估计特征重要性
-    if x_processed.shape[1] > 100:  # 特征太多时进行筛选
-        print(f"特征选择: 从 {x_processed.shape[1]} 个特征中筛选...")
-        X_sample = x_processed.values[:min(10000, len(x_processed))]
-        y_sample = y_processed.values[:min(10000, len(y_processed))]
-        
-        rf = RandomForestRegressor(n_estimators=100, random_state=42)
-        rf.fit(X_sample, y_sample.ravel())
-        
-        # 获取特征重要性并排序
-        importances = rf.feature_importances_
-        indices = np.argsort(importances)[::-1]
-        
-        # 选择重要性累计达到95%的特征
-        cum_importance = np.cumsum(importances[indices])
-        importance_threshold = 0.95
-        num_features = np.where(cum_importance >= importance_threshold)[0][0] + 1
-        
-        selected_features = list(x_processed.columns[indices[:num_features]])
-        print(f"选择了 {len(selected_features)} 个重要特征 (占总重要性的 {importance_threshold*100:.1f}%)")
-        
-        # 保留重要特征
-        x_processed = x_processed[selected_features]
-    
-    # 标准化特征
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(x_processed.values)
-    
-    # 划分训练、验证和测试集
-    train_size = int(0.7 * len(X_scaled))
-    val_size = int(0.15 * len(X_scaled))
-    
-    X_train = torch.tensor(X_scaled[:train_size], dtype=torch.float32)
-    y_train = torch.tensor(y_processed.values[:train_size], dtype=torch.float32)
-    
-    X_val = torch.tensor(X_scaled[train_size:train_size+val_size], dtype=torch.float32)
-    y_val = torch.tensor(y_processed.values[train_size:train_size+val_size], dtype=torch.float32)
-    
-    X_test = torch.tensor(X_scaled[train_size+val_size:], dtype=torch.float32)
-    y_test = torch.tensor(y_processed.values[train_size+val_size:], dtype=torch.float32)
-    
-    # 训练多种模型
-    input_dim = X_train.shape[1]
-    models_to_train = []
-    
-    # 1. 深度学习模型
-    models_to_train.extend([
-        ("linear", LinearModel(input_dim)),
-        ("mlp_small", MLPModel(input_dim, [64, 32])),
-        ("mlp_large", MLPModel(input_dim, [256, 128, 64])),
-        ("lstm", LSTMModel(input_dim, hidden_dim=128)),
-        ("bilstm", BiLSTMModel(input_dim, hidden_dim=128)),
-        ("resnet", ResNetModel(input_dim, hidden_dim=128)),
-        ("cnn", CNNModel(input_dim))
-    ])
-    
-    # 2. 传统机器学习模型
-    X_train_np = X_train.numpy()
-    y_train_np = y_train.numpy().flatten()
-    X_val_np = X_val.numpy()
-    y_val_np = y_val.numpy().flatten()
-    
-    rf_model = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
-    gb_model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42)
-    
-    # 训练结果
-    model_results = {}
-    all_models = []
-    model_accuracies = []
-    
-    # 训练深度学习模型
-    for name, model in models_to_train:
-        print(f"训练 {name} 模型...")
-        try:
-            trained_model, val_acc = train_model(
-                model, X_train, y_train, X_val, y_val, 
-                is_wind_farm=is_wind_farm,
-                num_epochs=300
-            )
-            model_results[name] = (trained_model, val_acc)
-            all_models.append(trained_model)
-            model_accuracies.append(max(0.1, val_acc))  # 确保权重为正
-            print(f"{name} 验证准确率: {val_acc:.4f}")
-        except Exception as e:
-            print(f"训练 {name} 时出错: {str(e)}")
-    
-    # 训练传统机器学习模型
-    print("训练 Random Forest 模型...")
-    try:
-        rf_model.fit(X_train_np, y_train_np)
-        rf_pred = rf_model.predict(X_val_np)
-        rf_acc = calculate_accuracy(y_val_np, rf_pred)
-        rf_wrapper = SklearnModelWrapper(rf_model)
-        model_results['random_forest'] = (rf_wrapper, rf_acc)
-        all_models.append(rf_wrapper)
-        model_accuracies.append(max(0.1, rf_acc))
-        print(f"Random Forest 验证准确率: {rf_acc:.4f}")
-    except Exception as e:
-        print(f"训练 Random Forest 时出错: {str(e)}")
-    
-    print("训练 Gradient Boosting 模型...")
-    try:
-        gb_model.fit(X_train_np, y_train_np)
-        gb_pred = gb_model.predict(X_val_np)
-        gb_acc = calculate_accuracy(y_val_np, gb_pred)
-        gb_wrapper = SklearnModelWrapper(gb_model)
-        model_results['gradient_boosting'] = (gb_wrapper, gb_acc)
-        all_models.append(gb_wrapper)
-        model_accuracies.append(max(0.1, gb_acc))
-        print(f"Gradient Boosting 验证准确率: {gb_acc:.4f}")
-    except Exception as e:
-        print(f"训练 Gradient Boosting 时出错: {str(e)}")
-    
-    # 模型评估和排序
-    print("\n模型性能总结:")
-    for name, (model, acc) in sorted(model_results.items(), key=lambda x: x[1][1], reverse=True):
-        print(f"模型: {name}, 准确率: {acc:.4f}")
-    
-    # 创建自适应集成模型
-    print("\n创建自适应集成模型...")
-    # 选择最佳的一组模型
-    sorted_models = sorted(model_results.items(), key=lambda x: x[1][1], reverse=True)
-    
-    # 由于我们需要确保集成模型的准确率达到0.9，需要选择表现最好的几个模型
-    # 这里选择前5个模型，权重基于其验证准确率
-    top_n = min(5, len(sorted_models))
-    top_models = [model for name, (model, acc) in sorted_models[:top_n]]
-    top_accuracies = [acc for name, (model, acc) in sorted_models[:top_n]]
-    
-    # 使用自适应集成
-    ensemble = AdaptiveEnsembleModel(top_models, base_weights=top_accuracies)
-    
-    # 存储元数据
-    ensemble.scaler = scaler
-    ensemble.feature_columns = list(x_processed.columns)
-    ensemble.is_wind_farm = is_wind_farm
-    ensemble.model_names = [name for name, _ in sorted_models[:top_n]]
-    
-    # 最终评估
-    # 从validatin set中获取时间特征
-    time_features = {'hour': x_df.loc[X_val.index]['hour'].values if 'hour' in x_df.columns else None,
-                     'month': x_df.loc[X_val.index]['month'].values if 'month' in x_df.columns else None}
-    
-    ensemble_val_pred = ensemble.predict(X_val_np, time_features).flatten()
-    ensemble_val_acc = calculate_accuracy(y_val_np, ensemble_val_pred)
-    print(f"集成模型验证准确率: {ensemble_val_acc:.4f}")
-    
-    # 在测试集上评估
-    X_test_np = X_test.numpy()
-    y_test_np = y_test.numpy().flatten()
-    
-    # Get time features from the original DataFrame directly
-    time_features_test = {
-        'hour': x_df.loc[x_processed.index[train_size+val_size:]]['hour'].values if 'hour' in x_df.columns else None,
-        'month': x_df.loc[x_processed.index[train_size+val_size:]]['month'].values if 'month' in x_df.columns else None
-    }
-    
-    ensemble_test_pred = ensemble.predict(X_test_np, time_features_test).flatten()
-    ensemble_test_acc = calculate_accuracy(y_test_np, ensemble_test_pred)
-    print(f"集成模型测试准确率: {ensemble_test_acc:.4f}")
-    
-    return ensemble
 
 # 示例使用:
 # 要使用以上高级函数实现0.9准确率，可以将主程序中的train函数替换为train_for_high_accuracy
