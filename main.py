@@ -13,6 +13,7 @@ from sklearn.preprocessing import StandardScaler, PowerTransformer
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import warnings
+import inspect
 warnings.filterwarnings('ignore')
 
 # 多层感知机模型
@@ -671,6 +672,54 @@ def train(farm_id):
         
         # 提取特征
         features_dict = extract_features(nwp_data, is_wind_farm, num_days=365)
+        
+        # 如果use_advanced_training为True，进行额外的特征工程
+        if 'use_advanced_training' in globals() and use_advanced_training:
+            # 添加风能和太阳能发电的物理特征
+            if is_wind_farm:
+                # 风电专有物理模型特征
+                ws = features_dict['ws']  # 风速
+                
+                # 风力机功率曲线建模（简化）
+                # 典型风力机参数
+                cut_in = 3.0    # 启动风速 (m/s)
+                rated = 12.0    # 额定风速 (m/s)
+                cut_out = 25.0  # 切出风速 (m/s)
+                
+                # 创建风机功率曲线近似
+                power_curve = np.zeros_like(ws)
+                for i in range(ws.shape[0]):
+                    for j in range(ws.shape[1]):
+                        v = ws[i, j]
+                        if v < cut_in:
+                            power_curve[i, j] = 0
+                        elif v < rated:
+                            # 启动到额定之间是非线性增长，通常与v³成比例
+                            power_curve[i, j] = ((v - cut_in) / (rated - cut_in))**3
+                        elif v < cut_out:
+                            power_curve[i, j] = 1.0  # 额定功率
+                        else:
+                            power_curve[i, j] = 0  # 大风保护停机
+                
+                features_dict['power_curve_approx'] = power_curve
+            else:
+                # 太阳能专有物理模型特征
+                if 'ghi' in features_dict and 't2m' in features_dict:
+                    ghi = features_dict['ghi']
+                    t2m = features_dict['t2m']
+                    
+                    # 太阳能板温度估计 (使用NOCT方法)
+                    t2m_celsius = t2m - 273.15  # 开尔文转摄氏度
+                    nominal_operating_temp = 45  # 典型NOCT值
+                    
+                    # 板温 = 环境温度 + (NOCT-20)/800 * 辐照度
+                    panel_temp = np.zeros_like(ghi)
+                    for i in range(ghi.shape[0]):
+                        for j in range(ghi.shape[1]):
+                            panel_temp[i, j] = t2m_celsius[i, j] + (nominal_operating_temp - 20) / 800 * ghi[i, j]
+                    
+                    features_dict['panel_temperature'] = panel_temp
+        
         nwp_df = create_feature_dataframe(features_dict, nwp)
         x_df = pd.concat([x_df, nwp_df], axis=1)
     
@@ -686,15 +735,37 @@ def train(farm_id):
     
     # 数据预处理
     x_processed, y_processed = data_preprocess(x_df, y_df)
-    y_processed[y_processed < 0] = 0
     
-    # 应用非线性变换以处理偏斜分布（可选）
-    use_power_transform = False
-    if use_power_transform:
-        pt = PowerTransformer(method='yeo-johnson')
-        y_values = y_processed.values.reshape(-1, 1)
-        y_transformed = pt.fit_transform(y_values)
-        y_processed = pd.DataFrame(y_transformed, index=y_processed.index, columns=y_processed.columns)
+    # 使用高级预处理（如果启用）
+    if 'use_advanced_training' in globals() and use_advanced_training:
+        # 异常值检测和修复
+        hours = x_df.index.hour
+        
+        # 太阳能夜间处理
+        if not is_wind_farm:
+            # 确保太阳能夜间输出为0
+            night_mask = (hours < 6) | (hours > 19)
+            y_processed.loc[night_mask] = 0
+        
+        # 输出异常值处理
+        for col in y_processed.columns:
+            values = y_processed[col].values
+            q25 = np.percentile(values, 25)
+            q75 = np.percentile(values, 75)
+            iqr = q75 - q25
+            
+            # IQR方法检测异常
+            lower_bound = q25 - 3 * iqr
+            upper_bound = q75 + 3 * iqr
+            
+            outliers = (values < lower_bound) | (values > upper_bound)
+            if np.any(outliers):
+                # 使用移动中位数替换异常值
+                window = 24  # 24小时窗口
+                median_values = y_processed[col].rolling(window=window, center=True, min_periods=1).median()
+                y_processed.loc[outliers, col] = median_values[outliers]
+    
+    y_processed[y_processed < 0] = 0
     
     # 标准化特征
     scaler = StandardScaler()
@@ -760,13 +831,27 @@ def train(farm_id):
     model_results['cnn'] = (cnn_model, cnn_acc)
     print(f"CNN model validation accuracy: {cnn_acc:.4f}")
     
-    # 8. Transformer模型(如果数据量足够)
-    if len(X_train) > 1000:
-        print("Training Transformer model...")
-        transformer_model = TransformerModel(input_dim)
-        transformer_model, transformer_acc = train_model(transformer_model, X_train, y_train, X_val, y_val, is_wind_farm=is_wind_farm)
-        model_results['transformer'] = (transformer_model, transformer_acc)
-        print(f"Transformer model validation accuracy: {transformer_acc:.4f}")
+    # 8. 如果use_advanced_training为True，添加高级模型 - BiLSTM和ResNet
+    if 'use_advanced_training' in globals() and use_advanced_training and 'BiLSTMModel' in globals() and 'ResNetModel' in globals():
+        # 训练BiLSTM
+        print("Training BiLSTM model...")
+        try:
+            bilstm_model = BiLSTMModel(input_dim, hidden_dim=128)
+            bilstm_model, bilstm_acc = train_model(bilstm_model, X_train, y_train, X_val, y_val, is_wind_farm=is_wind_farm)
+            model_results['bilstm'] = (bilstm_model, bilstm_acc)
+            print(f"BiLSTM model validation accuracy: {bilstm_acc:.4f}")
+        except Exception as e:
+            print(f"Error training BiLSTM: {str(e)}")
+        
+        # 训练ResNet
+        print("Training ResNet model...")
+        try:
+            resnet_model = ResNetModel(input_dim, hidden_dim=128)
+            resnet_model, resnet_acc = train_model(resnet_model, X_train, y_train, X_val, y_val, is_wind_farm=is_wind_farm)
+            model_results['resnet'] = (resnet_model, resnet_acc)
+            print(f"ResNet model validation accuracy: {resnet_acc:.4f}")
+        except Exception as e:
+            print(f"Error training ResNet: {str(e)}")
     
     # 9. 传统机器学习模型 - RandomForest
     print("Training Random Forest model...")
@@ -803,25 +888,48 @@ def train(farm_id):
     best_single_model, best_acc = model_results[best_model_name]
     print(f"\nBest single model: {best_model_name} with accuracy {best_acc:.4f}")
     
-    # 创建加权集成模型（选择表现前三名的模型）
+    # 创建集成模型 - 标准或高级自适应集成
     sorted_models = sorted(model_results.items(), key=lambda x: x[1][1], reverse=True)
-    top_models = [model for name, (model, acc) in sorted_models[:3]]
     
-    # 基于验证集准确度计算权重
-    weights = [acc for _, (_, acc) in sorted_models[:3]]
-    # 将负准确率转换为正值以用作权重
-    weights = [max(0.1, w) for w in weights]
-    
-    ensemble = WeightedEnsembleModel(top_models, weights=weights)
+    # 使用高级自适应集成或标准集成
+    if 'use_advanced_training' in globals() and use_advanced_training and 'AdaptiveEnsembleModel' in globals():
+        # 选择前5个最佳模型
+        top_n = min(5, len(sorted_models))
+        top_models = [model for name, (model, acc) in sorted_models[:top_n]]
+        top_accuracies = [acc for name, (model, acc) in sorted_models[:top_n]]
+        
+        # 使用自适应集成
+        ensemble = AdaptiveEnsembleModel(top_models, base_weights=top_accuracies)
+        print(f"Using adaptive ensemble with top {top_n} models")
+    else:
+        # 标准集成 - 选择前3名模型
+        top_models = [model for name, (model, acc) in sorted_models[:3]]
+        weights = [acc for _, (_, acc) in sorted_models[:3]]
+        weights = [max(0.1, w) for w in weights]
+        
+        # 使用标准加权集成
+        ensemble = WeightedEnsembleModel(top_models, weights=weights)
+        print(f"Using standard weighted ensemble with top 3 models")
     
     # 存储元数据
     ensemble.scaler = scaler
     ensemble.feature_columns = list(x_processed.columns)
     ensemble.is_wind_farm = is_wind_farm
-    ensemble.model_names = [name for name, _ in sorted_models[:3]]
+    ensemble.model_names = [name for name, _ in sorted_models[:min(5, len(sorted_models))]]
     
     # 评估集成模型
-    ensemble_pred = ensemble.predict(X_val.numpy()).flatten()
+    if 'use_advanced_training' in globals() and use_advanced_training:
+        # Extract time features from x_df directly using the same indices as X_val
+        # Avoid trying to use tensor.index which doesn't exist
+        val_indices = x_processed.index[train_size:]
+        time_features = {
+            'hour': x_df.loc[val_indices]['hour'].values if 'hour' in x_df.columns else None,
+            'month': x_df.loc[val_indices]['month'].values if 'month' in x_df.columns else None
+        }
+        ensemble_pred = ensemble.predict(X_val.numpy(), time_features).flatten()
+    else:
+        ensemble_pred = ensemble.predict(X_val.numpy()).flatten()
+    
     ensemble_acc = calculate_accuracy(y_val.numpy().flatten(), ensemble_pred)
     print(f"Ensemble model validation accuracy: {ensemble_acc:.4f}")
     
@@ -865,9 +973,17 @@ def predict(model, farm_id):
     X_scaled = model.scaler.transform(x_df.values) if hasattr(model, 'scaler') else x_df.values
     
     # 使用模型进行预测 - 区分不同类型的模型
-    if isinstance(model, WeightedEnsembleModel):
+    if isinstance(model, WeightedEnsembleModel) or isinstance(model, AdaptiveEnsembleModel):
         # 处理集成模型
-        pred_pw = model.predict(X_scaled).flatten()
+        if hasattr(model, 'scaler') and 'time_features' in inspect.signature(model.predict).parameters:
+            # AdaptiveEnsembleModel需要时间特征
+            time_features = {
+                'hour': x_df['hour'].values if 'hour' in x_df.columns else None,
+                'month': x_df['month'].values if 'month' in x_df.columns else None
+            }
+            pred_pw = model.predict(X_scaled, time_features).flatten()
+        else:
+            pred_pw = model.predict(X_scaled).flatten()
     else:
         # 单一模型
         X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
@@ -1094,18 +1210,23 @@ class ResNetModel(nn.Module):
 
 # 自适应混合集成模型 - 根据时间和天气条件动态调整模型权重
 class AdaptiveEnsembleModel:
-    def __init__(self, models, feature_importances=None):
+    def __init__(self, models, base_weights=None):
         self.models = models
-        self.feature_importances = feature_importances
-        self.base_weights = np.ones(len(models)) / len(models)
+        # 设置基础权重，如果未提供则平均分配
+        if base_weights is None:
+            self.base_weights = np.ones(len(models)) / len(models)
+        else:
+            # 确保权重总和为1
+            self.base_weights = np.array(base_weights) / np.sum(base_weights)
         
     def predict(self, X, time_features=None):
         """动态加权预测
         
         Args:
             X: 输入特征
-            time_features: 包含小时、季节信息的特征
+            time_features: 包含时间信息的字典(小时、月份等)
         """
+        # 收集每个模型的预测
         predictions = []
         for model in self.models:
             if isinstance(X, np.ndarray):
@@ -1121,34 +1242,55 @@ class AdaptiveEnsembleModel:
                 pred = model.predict(X)
             predictions.append(pred.flatten())
         
-        # 基本权重
+        # 使用基础权重副本
         weights = self.base_weights.copy()
         
-        # 如果提供了时间特征，根据时间特征调整权重
+        # 根据时间或其他特征动态调整权重
         if time_features is not None:
             hour = time_features.get('hour', None)
             month = time_features.get('month', None)
             
-            # 例如，在白天更信任基于CNN的模型（索引2），晚上更信任LSTM（索引1）
+            # 根据一天中的时间调整
             if hour is not None:
-                if 8 <= hour <= 16:  # 白天
-                    weights[2] *= 1.2  # 增加CNN权重
-                elif 22 <= hour or hour <= 4:  # 晚上
-                    weights[1] *= 1.2  # 增加LSTM权重
+                # 示例：深度学习模型在白天表现更好，树模型在夜晚更可靠
+                if isinstance(hour, (int, float)):
+                    # 单个值
+                    if 8 <= hour <= 16:  # 白天
+                        weights[0:3] *= 1.2  # 增加神经网络模型权重
+                    else:  # 夜晚/早晨/傍晚
+                        weights[3:] *= 1.2  # 增加树模型权重
+                else:
+                    # 数组值
+                    for i, h in enumerate(hour):
+                        if 8 <= h <= 16:
+                            for j in range(min(3, len(weights))):
+                                weights[j] *= 1.2
+                        else:
+                            for j in range(3, len(weights)):
+                                weights[j] *= 1.2
             
-            # 在不同季节调整权重
+            # 根据季节调整
             if month is not None:
-                if 3 <= month <= 5:  # 春季
-                    weights[0] *= 1.1  # 增加某个模型权重
-                elif 6 <= month <= 8:  # 夏季
-                    weights[3] *= 1.1  # 增加另一个模型权重
+                # 示例：不同季节调整权重
+                if isinstance(month, (int, float)):
+                    # 春夏秋冬不同模型表现不同
+                    if 3 <= month <= 5:  # 春季
+                        weights[0] *= 1.2  # 假设第一个模型在春季表现更好
+                    elif 6 <= month <= 8:  # 夏季
+                        weights[1] *= 1.2  # 假设第二个模型在夏季表现更好
+                    elif 9 <= month <= 11:  # 秋季
+                        weights[2] *= 1.2
+                    else:  # 冬季
+                        weights[3] *= 1.2
         
         # 重新归一化权重
         weights = weights / np.sum(weights)
         
-        # 加权预测
+        # 加权组合预测结果
         predictions = np.vstack(predictions)
-        return np.sum(predictions.T * weights, axis=1).reshape(-1, 1)
+        weighted_pred = np.sum(predictions.T * weights, axis=1).reshape(-1, 1)
+        
+        return weighted_pred
 
 # 改进的特征提取函数，加入更高级的物理特征和统计特征
 def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365, hour_of_day=None):
@@ -1509,8 +1651,11 @@ def train_advanced(farm_id):
         ensemble.model_names = [name for name, _ in sorted_models[:5]]
         
         # 4. 评估集成模型
-        time_features = {'hour': X_val.numpy()[:, feature_names.index('hour')] if 'hour' in feature_names else None,
-                         'month': X_val.numpy()[:, feature_names.index('month')] if 'month' in feature_names else None}
+        # Get time features from the original DataFrame directly
+        time_features = {
+            'hour': x_df.loc[x_processed.index[train_size:train_size+val_size]]['hour'].values if 'hour' in x_df.columns else None,
+            'month': x_df.loc[x_processed.index[train_size:train_size+val_size]]['month'].values if 'month' in x_df.columns else None
+        }
         ensemble_pred = ensemble.predict(X_val.numpy(), time_features).flatten()
         ensemble_acc = calculate_accuracy(y_val.numpy().flatten(), ensemble_pred)
         print(f"Adaptive Ensemble model validation accuracy: {ensemble_acc:.4f}")
@@ -1530,7 +1675,9 @@ for farm_id in farms:
         
         # 选择训练方法
         if use_advanced_training:
-            model = train_for_high_accuracy(farm_id)
+            # 使用现有train函数但启用更多模型
+            print("Using enhanced training for high accuracy...")
+            model = train(farm_id)  # 继续使用原有train函数
         else:
             model = train(farm_id)
         
@@ -1539,7 +1686,7 @@ for farm_id in farms:
         os.makedirs(model_path, exist_ok=True)
         model_name = 'baseline_middle_school.pkl'  # 与原始代码保持一致的名称
         
-        print(f"Saving {'advanced' if use_advanced_training else 'standard'} model for farm {farm_id}")
+        print(f"Saving {'enhanced' if use_advanced_training else 'standard'} model for farm {farm_id}")
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model, f)
         
@@ -1659,7 +1806,7 @@ for farm_id in farms:
                     
                     # 创建钟形曲线，加入季节变化
                     for i in range(len(dates)):
-                        if day_minutes[i]:
+                      if day_minutes[i]:
                         # 计算太阳高度角（简化）
                         sun_angle = np.zeros(len(dates))
                         for i, (hour, day) in enumerate(zip(hours, days)):
@@ -1691,7 +1838,7 @@ for farm_id in farms:
                     res.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
                     print(f"Created simple pattern for farm {farm_id}")
                     
-                except Exception as e3:
+            except Exception as e3:
                     print(f"All methods failed for farm {farm_id}: {str(e3)}")
 
     print('All farms processed')
@@ -2186,8 +2333,11 @@ def train_for_high_accuracy(farm_id):
     X_test_np = X_test.numpy()
     y_test_np = y_test.numpy().flatten()
     
-    time_features_test = {'hour': x_df.loc[X_test.index]['hour'].values if 'hour' in x_df.columns else None,
-                          'month': x_df.loc[X_test.index]['month'].values if 'month' in x_df.columns else None}
+    # Get time features from the original DataFrame directly
+    time_features_test = {
+        'hour': x_df.loc[x_processed.index[train_size+val_size:]]['hour'].values if 'hour' in x_df.columns else None,
+        'month': x_df.loc[x_processed.index[train_size+val_size:]]['month'].values if 'month' in x_df.columns else None
+    }
     
     ensemble_test_pred = ensemble.predict(X_test_np, time_features_test).flatten()
     ensemble_test_acc = calculate_accuracy(y_test_np, ensemble_test_pred)
