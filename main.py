@@ -739,84 +739,43 @@ class ResNetModel(nn.Module):
         with torch.no_grad():
             return self(X).numpy()
 
-# 自适应加权集成模型 - 根据时间和特征条件动态调整模型权重
-class AdaptiveEnsembleModel(nn.Module): # Inherit from nn.Module for consistency if it might be saved like other torch models
+# 自适应混合集成模型 - 根据时间和天气条件动态调整模型权重
+class AdaptiveEnsembleModel:
     def __init__(self, models, base_weights=None):
-        super(AdaptiveEnsembleModel, self).__init__() # Add super init
-        self.models = nn.ModuleList(models) # Store models in ModuleList
+        self.models = models
         # 设置基础权重，如果未提供则平均分配
         if base_weights is None:
-            self.base_weights = nn.Parameter(torch.ones(len(models)) / len(models), requires_grad=False)
+            self.base_weights = np.ones(len(models)) / len(models)
         else:
             # 确保权重总和为1
-            self.base_weights = nn.Parameter(torch.tensor(np.array(base_weights) / np.sum(base_weights), dtype=torch.float32), requires_grad=False)
+            self.base_weights = np.array(base_weights) / np.sum(base_weights)
         
-    def predict(self, X_np, time_features=None): # Changed X to X_np for clarity as it's numpy
-        """动态加权预测
+    def predict(self, X, time_features=None):
+        """简化的预测方法
         
         Args:
-            X_np: 输入特征 (numpy array)
-            time_features: 包含时间信息的字典(小时、月份等)
+            X: 输入特征 (numpy array)
+            time_features: 可选时间特征，简化版本中不使用
         """
         # 收集每个模型的预测
         predictions = []
         
-        # Convert X_np to tensor for PyTorch models if not already handled by SklearnModelWrapper
-        # This part assumes X_np is the direct input for predict
-        # SklearnModelWrapper handles numpy input internally.
-        # PyTorch models in the ensemble need tensor input.
-        X_tensor_for_torch_models = torch.tensor(X_np, dtype=torch.float32)
-
-        for model_idx, model in enumerate(self.models):
+        # 调用每个模型的predict方法
+        for model in self.models:
             if isinstance(model, SklearnModelWrapper):
-                pred = model.predict(X_np) # Sklearn models take numpy
-            else: # PyTorch model
+                pred = model.predict(X)
+            else:
+                # PyTorch模型
+                X_tensor = torch.tensor(X, dtype=torch.float32)
                 model.eval()
                 with torch.no_grad():
-                    pred = model(X_tensor_for_torch_models).cpu().numpy()
+                    pred = model(X_tensor).cpu().numpy()
+            
             predictions.append(pred.flatten())
         
-        # 使用基础权重副本 (convert parameter to numpy for manipulation)
-        current_weights = self.base_weights.detach().cpu().numpy().copy()
-        
-        # 根据时间或其他特征动态调整权重
-        if time_features is not None:
-            hour = time_features.get('hour', None)
-            month = time_features.get('month', None)
-            
-            # 根据一天中的时间调整
-            if hour is not None:
-                # Ensure hour is an array for consistent processing
-                hour_array = np.array(hour) if isinstance(hour, (int, float)) else hour
-                
-                for i in range(len(X_np)): # Iterate over batch dimension
-                    h = hour_array[i] if len(hour_array) > 1 else hour_array[0]
-                    # Example: Deep learning models (first 3) better during day, tree models (next) more reliable otherwise
-                    # This logic needs to be robust to the number of models and their types.
-                    # Assuming first N models are DL, rest are tree/other. This is fragile.
-                    # A better approach might be to tag models or use their class types.
-                    if 8 <= h <= 16:  # 白天
-                        for j in range(min(3, len(current_weights))): # Adapt based on actual model types
-                             current_weights[j] *= 1.2 
-                    else:  # 夜晚/早晨/傍晚
-                        for j in range(min(3, len(current_weights)), len(current_weights)): # Adapt
-                             current_weights[j] *= 1.2
-            
-            # 根据季节调整 (Simplified logic, apply uniformly if single value)
-            if month is not None:
-                month_val = month[0] if isinstance(month, np.ndarray) and len(month)>0 else month # Take first if array
-                if isinstance(month_val, (int, float)):
-                    if 3 <= month_val <= 5: current_weights[0 % len(current_weights)] *= 1.2
-                    elif 6 <= month_val <= 8: current_weights[1 % len(current_weights)] *= 1.2
-                    elif 9 <= month_val <= 11: current_weights[2 % len(current_weights)] *= 1.2
-                    else: current_weights[3 % len(current_weights)] *= 1.2
-        
-        # 重新归一化权重
-        current_weights = current_weights / np.sum(current_weights)
-        
-        # 加权组合预测结果
-        predictions_np = np.vstack(predictions) # predictions are already numpy arrays
-        weighted_pred = np.sum(predictions_np.T * current_weights, axis=1).reshape(-1, 1)
+        # 简单加权平均，不做动态调整
+        predictions = np.vstack(predictions)
+        weighted_pred = np.sum(predictions.T * self.base_weights, axis=1).reshape(-1, 1)
         
         return weighted_pred
 
@@ -905,7 +864,7 @@ def advanced_preprocess(x_df, y_df, is_wind_farm=True):
 
 # 用于0.9准确率的训练函数
 def train_for_high_accuracy(farm_id):
-    """追求超高准确率的训练函数，使用高级特征和集成策略"""
+    """追求高准确率的简化训练函数，使用稳定可靠的模型组合"""
     is_wind_farm = farm_id <= 5
     print(f"Training {'wind' if is_wind_farm else 'solar'} farm {farm_id} for high accuracy")
     
@@ -914,121 +873,125 @@ def train_for_high_accuracy(farm_id):
     for nwp in nwps:
         nwp_path = os.path.join(nwp_train_path, nwp)
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
-        features_dict = enhanced_extract_features(nwp_data, is_wind_farm, num_days=365)
-        nwp_df = create_feature_dataframe(features_dict, nwp) # Assuming this is defined
+        features_dict = extract_features(nwp_data, is_wind_farm, num_days=365)
+        nwp_df = create_feature_dataframe(features_dict, nwp)
         x_df_full = pd.concat([x_df_full, nwp_df], axis=1)
     
     x_df_full.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
-    x_df_full = add_time_features(x_df_full) # Assuming this is defined
+    x_df_full = add_time_features(x_df_full)
     
     y_df_full = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
     y_df_full.index = pd.to_datetime(y_df_full.index)
     y_df_full.columns = ['power']
     
-    x_processed, y_processed = advanced_preprocess(x_df_full, y_df_full, is_wind_farm)
+    x_processed, y_processed = data_preprocess(x_df_full, y_df_full)
     
+    # 如果特征数量太多，进行简单的特征选择
     if x_processed.shape[1] > 100:
         print(f"特征选择: 从 {x_processed.shape[1]} 个特征中筛选...")
-        # Ensure y_sample is 1D for RandomForestRegressor
-        y_sample_1d = y_processed.values[:min(10000, len(y_processed))].ravel() 
+        # 使用随机森林进行特征重要性排序
         X_sample = x_processed.values[:min(10000, len(x_processed))]
+        y_sample = y_processed.values[:min(10000, len(y_processed))].ravel()
         
-        rf_selector = RandomForestRegressor(n_estimators=100, random_state=42)
-        rf_selector.fit(X_sample, y_sample_1d)
+        rf_selector = RandomForestRegressor(n_estimators=50, random_state=42)
+        rf_selector.fit(X_sample, y_sample)
         importances = rf_selector.feature_importances_
         indices = np.argsort(importances)[::-1]
-        cum_importance = np.cumsum(importances[indices])
-        num_features = np.where(cum_importance >= 0.95)[0][0] + 1
-        selected_feature_names = list(x_processed.columns[indices[:num_features]])
+        
+        # 只保留前50%最重要的特征
+        n_features_to_keep = max(30, int(0.5 * len(indices)))
+        selected_indices = indices[:n_features_to_keep]
+        selected_feature_names = list(x_processed.columns[selected_indices])
         print(f"选择了 {len(selected_feature_names)} 个重要特征")
         x_processed = x_processed[selected_feature_names]
     
+    # 标准化特征
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(x_processed.values)
     
-    train_size = int(0.7 * len(X_scaled)); val_size = int(0.15 * len(X_scaled))
-    X_train_pt = torch.tensor(X_scaled[:train_size], dtype=torch.float32)
-    y_train_pt = torch.tensor(y_processed.values[:train_size], dtype=torch.float32)
-    X_val_pt = torch.tensor(X_scaled[train_size:train_size+val_size], dtype=torch.float32)
-    y_val_pt = torch.tensor(y_processed.values[train_size:train_size+val_size], dtype=torch.float32)
-    # X_test_pt for a final hold-out, if needed for reporting, but not used for model saving/selection here
-    # X_test_pt = torch.tensor(X_scaled[train_size+val_size:], dtype=torch.float32)
-    # y_test_pt = torch.tensor(y_processed.values[train_size+val_size:], dtype=torch.float32)
+    # 数据划分
+    train_size = int(0.7 * len(X_scaled))
+    val_size = int(0.15 * len(X_scaled))
+    X_train_np = X_scaled[:train_size]
+    y_train_np = y_processed.values[:train_size]
+    X_val_np = X_scaled[train_size:train_size+val_size]
+    y_val_np = y_processed.values[train_size:train_size+val_size]
+    
+    # 转换为PyTorch张量
+    X_train_pt = torch.tensor(X_train_np, dtype=torch.float32)
+    y_train_pt = torch.tensor(y_train_np, dtype=torch.float32)
+    X_val_pt = torch.tensor(X_val_np, dtype=torch.float32)
+    y_val_pt = torch.tensor(y_val_np, dtype=torch.float32)
 
     input_dim = X_train_pt.shape[1]
+    
+    # 简化的模型集合，只使用稳定可靠的模型
     model_definitions = [
-        ("linear", LinearModel(input_dim)), ("mlp_small", MLPModel(input_dim, [64, 32])),
-        ("mlp_large", MLPModel(input_dim, [256, 128, 64])), ("lstm", LSTMModel(input_dim, hidden_dim=128)),
-        ("bilstm", BiLSTMModel(input_dim, hidden_dim=128)), ("resnet", ResNetModel(input_dim, hidden_dim=128)),
-        ("cnn", CNNModel(input_dim))
+        ("linear", LinearModel(input_dim)),
+        ("mlp_small", MLPModel(input_dim, [64, 32])),
+        ("mlp_medium", MLPModel(input_dim, [128, 64])),
     ]
     
-    X_train_np = X_train_pt.numpy(); y_train_np_flat = y_train_pt.numpy().flatten()
-    X_val_np = X_val_pt.numpy(); y_val_np_flat = y_val_pt.numpy().flatten()
-
     model_results = {}
     
+    # 训练PyTorch模型
+    print("训练PyTorch模型...")
     for name, model_obj in model_definitions:
         print(f"训练 {name} 模型...")
         try:
-            # train_model is assumed to be defined elsewhere and handles PyTorch models
-            trained_m, val_acc = train_model(model_obj, X_train_pt, y_train_pt, X_val_pt, y_val_pt, is_wind_farm=is_wind_farm, num_epochs=300)
+            trained_m, val_acc = train_model(model_obj, X_train_pt, y_train_pt, X_val_pt, y_val_pt, 
+                                            is_wind_farm=is_wind_farm, num_epochs=200, batch_size=128)
             model_results[name] = (trained_m, val_acc)
             print(f"{name} 验证准确率: {val_acc:.4f}")
-        except Exception as e: print(f"训练 {name} 时出错: {str(e)}")
+        except Exception as e: 
+            print(f"训练 {name} 时出错: {str(e)}")
 
-    # Train Sklearn models
-    sklearn_models_def = {
-        "random_forest": RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42),
-        "gradient_boosting": GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42)
+    # 训练Sklearn模型
+    print("训练Sklearn模型...")
+    sklearn_models = {
+        "random_forest": RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42),
+        "gradient_boosting": GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42)
     }
-    for name, model_sk in sklearn_models_def.items():
+    
+    for name, model_sk in sklearn_models.items():
         print(f"训练 {name} 模型...")
         try:
-            model_sk.fit(X_train_np, y_train_np_flat)
+            model_sk.fit(X_train_np, y_train_np.ravel())
             val_pred_sk = model_sk.predict(X_val_np)
-            val_acc_sk = calculate_accuracy(y_val_np_flat, val_pred_sk) # calculate_accuracy defined elsewhere
-            model_results[name] = (SklearnModelWrapper(model_sk), val_acc_sk) # Wrap for consistent interface
+            val_acc_sk = calculate_accuracy(y_val_np.ravel(), val_pred_sk)
+            model_results[name] = (SklearnModelWrapper(model_sk), val_acc_sk)
             print(f"{name} 验证准确率: {val_acc_sk:.4f}")
-        except Exception as e: print(f"训练 {name} 时出错: {str(e)}")
+        except Exception as e:
+            print(f"训练 {name} 时出错: {str(e)}")
 
-    print("\\n模型性能总结:")
-    # Sort by accuracy (descending)
+    print("\n模型性能总结:")
+    # 按准确率排序
     sorted_results = sorted(model_results.items(), key=lambda item: item[1][1], reverse=True)
     for name, (model_inst, acc) in sorted_results:
         print(f"模型: {name}, 准确率: {acc:.4f}")
     
     if not sorted_results:
-        print("No models trained successfully. Cannot create ensemble.")
+        print("没有模型成功训练，无法创建集成")
         return None
 
-    print("\\n创建自适应集成模型...")
-    top_n = min(5, len(sorted_results))
-    top_models_for_ensemble = [res[1][0] for res in sorted_results[:top_n]] # Get actual model instances
-    top_accuracies_for_weights = [res[1][1] for res in sorted_results[:top_n]]
+    print("\n创建简单集成模型...")
+    # 选择最多3个性能最好的模型
+    top_n = min(3, len(sorted_results))
+    top_models = [res[1][0] for res in sorted_results[:top_n]]
+    top_accuracies = [res[1][1] for res in sorted_results[:top_n]]
     
-    # Ensure AdaptiveEnsembleModel is correctly instantiated and used
-    # The AdaptiveEnsembleModel definition used here should be the nn.Module one if saving the whole ensemble
-    ensemble_model = AdaptiveEnsembleModel(top_models_for_ensemble, base_weights=top_accuracies_for_weights)
+    # 使用简单的加权平均集成
+    ensemble_model = WeightedEnsembleModel(top_models, weights=top_accuracies)
     
-    # Store metadata for prediction phase
+    # 存储元数据
     ensemble_model.scaler = scaler
-    # Ensure feature_columns are from the potentially reduced set after feature selection
-    ensemble_model.feature_columns = list(x_processed.columns) 
+    ensemble_model.feature_columns = list(x_processed.columns)
     ensemble_model.is_wind_farm = is_wind_farm
     ensemble_model.model_names_in_ensemble = [res[0] for res in sorted_results[:top_n]]
 
-    # Evaluate ensemble on validation set
-    # Prepare time features for validation set
-    val_indices = x_df_full.index.intersection(x_processed.index[train_size:train_size+val_size])
-    time_features_val = {
-        'hour': x_df_full.loc[val_indices]['hour'].values if 'hour' in x_df_full.columns else None,
-        'month': x_df_full.loc[val_indices]['month'].values if 'month' in x_df_full.columns else None
-    }
-    
-    # AdaptiveEnsembleModel.predict expects numpy array
-    ensemble_val_pred_np = ensemble_model.predict(X_val_np, time_features_val).flatten()
-    ensemble_val_acc = calculate_accuracy(y_val_np_flat, ensemble_val_pred_np)
+    # 评估集成模型
+    ensemble_val_pred = ensemble_model.predict(X_val_np).flatten()
+    ensemble_val_acc = calculate_accuracy(y_val_np.flatten(), ensemble_val_pred)
     print(f"集成模型验证准确率: {ensemble_val_acc:.4f}")
         
     return ensemble_model
@@ -1348,34 +1311,22 @@ def predict(model, farm_id):
     # 标准化特征
     X_scaled = model.scaler.transform(x_df.values) if hasattr(model, 'scaler') else x_df.values
     
-    # 使用模型进行预测 - 区分不同类型的模型
+    # 使用模型进行预测
     if isinstance(model, WeightedEnsembleModel) or isinstance(model, AdaptiveEnsembleModel):
-        # 处理集成模型
-        if hasattr(model, 'scaler') and 'time_features' in inspect.signature(model.predict).parameters:
-            # AdaptiveEnsembleModel需要时间特征
-            time_features = {
-                'hour': x_df['hour'].values if 'hour' in x_df.columns else None,
-                'month': x_df['month'].values if 'month' in x_df.columns else None
-            }
-            pred_pw = model.predict(X_scaled, time_features).flatten()
-        else:
-            pred_pw = model.predict(X_scaled).flatten()
+        # 集成模型
+        pred_pw = model.predict(X_scaled).flatten()
     else:
         # 单一模型
         X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
         if hasattr(model, 'predict'):
             # 调用predict方法
             try:
-                with torch.no_grad():
-                    if isinstance(model, SklearnModelWrapper):
-                        pred_pw = model.predict(X_scaled).flatten()
-                    else:
-                        pred_pw = model.predict(X_scaled).flatten()
+                pred_pw = model.predict(X_scaled).flatten()
             except Exception as e:
                 print(f"Error using predict method: {str(e)}")
                 # 回退到直接调用模型
                 with torch.no_grad():
-                    model.eval()  # 只有PyTorch模型需要这个
+                    model.eval()
                     pred_pw = model(X_tensor).cpu().numpy().flatten()
         else:
             # 直接调用模型
@@ -1390,7 +1341,7 @@ def predict(model, farm_id):
     pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
     
     # 插值到15分钟间隔
-    res = pred.resample('15min').interpolate(method='linear')
+    res = pred.resample('15min').interpolate(method='cubic')
     
     # 应用后处理规则 - 太阳能电场
     if not is_wind_farm:
@@ -1400,105 +1351,8 @@ def predict(model, farm_id):
         # 夜间值设为0（以当地日出日落时间为准）
         night_mask = (hours <= 5) | (hours >= 19)
         res.loc[night_mask] = 0
-        
-        # 日出时段（5:00-8:00）应该有平滑的增长
-        dawn_hours = (hours >= 5) & (hours < 8)
-        dawn_df = res[dawn_hours].copy()
-        
-        if not dawn_df.empty:
-            # 对每天分别处理
-            for day in set(dawn_df.index.date):
-                day_mask = dawn_df.index.date == day
-                day_values = dawn_df[day_mask]
-                
-                if not day_values.empty:
-                    # 创建平滑的增长曲线
-                    start_idx = day_values.index[0]
-                    end_idx = day_values.index[-1]
-                    start_val = max(0, day_values.iloc[0])
-                    
-                    # 查找8点的值，如果没有则使用下一个可用值
-                    next_hour_idx = res.index.searchsorted(pd.Timestamp(day).replace(hour=8))
-                    if next_hour_idx < len(res):
-                        end_val = res.iloc[next_hour_idx]
-                    else:
-                        end_val = max(0.1, day_values.iloc[-1])
-                    
-                    # 创建线性增长曲线
-                    t = np.linspace(0, 1, len(day_values))
-                    smooth_curve = start_val + t * (end_val - start_val)
-                    
-                    # 应用到原始数据 - 确保数据类型兼容
-                    res.loc[day_values.index] = smooth_curve.astype(res.dtype)
-        
-        # 日落时段（17:00-19:00）应该有平滑的下降
-        dusk_hours = (hours >= 17) & (hours < 19)
-        dusk_df = res[dusk_hours].copy()
-        
-        if not dusk_df.empty:
-            # 对每天分别处理
-            for day in set(dusk_df.index.date):
-                day_mask = dusk_df.index.date == day
-                day_values = dusk_df[day_mask]
-                
-                if not day_values.empty:
-                    # 创建平滑的下降曲线
-                    start_idx = day_values.index[0]
-                    end_idx = day_values.index[-1]
-                    
-                    # 查找17点的值
-                    prev_hour_idx = res.index.searchsorted(pd.Timestamp(day).replace(hour=17)) - 1
-                    if prev_hour_idx >= 0:
-                        start_val = res.iloc[prev_hour_idx]
-                    else:
-                        start_val = max(0.1, day_values.iloc[0])
-                    
-                    # 确保平滑下降到0
-                    t = np.linspace(0, 1, len(day_values))
-                    smooth_curve = start_val * (1 - t)
-                    
-                    # 应用到原始数据 - 确保数据类型兼容
-                    res.loc[day_values.index] = smooth_curve.astype(res.dtype)
     
-    # 应用后处理规则 - 风电场
-    else:
-        # 风电场的输出不应该有明显的零值
-        # 查找潜在的零值和异常低值
-        zero_mask = res < 0.01
-        
-        if np.any(zero_mask):
-            # 找到序列中最小的非零值作为替代值
-            min_nonzero = 0.01  # 默认最小值
-            nonzero_values = res[~zero_mask]
-            
-            if len(nonzero_values) > 0:
-                # 使用非零值的第5百分位数
-                percentile_5 = np.percentile(nonzero_values, 5)
-                min_nonzero = max(0.01, percentile_5 * 0.5)  # 确保至少为0.01
-            
-            # 将零值替换为最小非零值
-            if isinstance(res, pd.Series):
-                # 直接获取res的dtype
-                res_dtype = res.dtype
-                # 使用numpy的类型转换
-                min_nonzero_typed = np.array(min_nonzero).astype(res_dtype)
-                # 将标量值赋给Series
-                res.loc[zero_mask] = min_nonzero_typed.item()
-        
-        # 平滑处理 - 消除异常峰值和谷值
-        window_size = 4  # 1小时
-        res_smoothed = res.rolling(window=window_size, center=True, min_periods=1).mean()
-        
-        # 找出异常波动（与平滑值差距过大的点）
-        anomaly_mask = np.abs(res - res_smoothed) > 0.2 * res_smoothed
-        
-        # 仅替换异常点，保留正常波动，确保数据类型兼容
-        if np.any(anomaly_mask):
-            # 确保类型兼容
-            replacement_values = res_smoothed.loc[anomaly_mask].astype(res.dtype)
-            res.loc[anomaly_mask] = replacement_values
-    
-    # 最终确保所有预测在合理范围内
+    # 确保所有预测在合理范围内
     res = np.clip(res, 0, 1)
     
     return res
@@ -1583,90 +1437,6 @@ class ResNetModel(nn.Module):
         self.eval()
         with torch.no_grad():
             return self(X).numpy()
-
-# 自适应混合集成模型 - 根据时间和天气条件动态调整模型权重
-class AdaptiveEnsembleModel:
-    def __init__(self, models, base_weights=None):
-        self.models = models
-        # 设置基础权重，如果未提供则平均分配
-        if base_weights is None:
-            self.base_weights = np.ones(len(models)) / len(models)
-        else:
-            # 确保权重总和为1
-            self.base_weights = np.array(base_weights) / np.sum(base_weights)
-        
-    def predict(self, X, time_features=None):
-        """动态加权预测
-        
-        Args:
-            X: 输入特征
-            time_features: 包含时间信息的字典(小时、月份等)
-        """
-        # 收集每个模型的预测
-        predictions = []
-        for model in self.models:
-            if isinstance(X, np.ndarray):
-                X_tensor = torch.tensor(X, dtype=torch.float32)
-                if hasattr(model, 'eval'):
-                    model.eval()
-                if isinstance(model, SklearnModelWrapper):
-                    pred = model.predict(X)
-                else:
-                    with torch.no_grad():
-                        pred = model(X_tensor).cpu().numpy()
-            else:
-                pred = model.predict(X)
-            predictions.append(pred.flatten())
-        
-        # 使用基础权重副本
-        weights = self.base_weights.copy()
-        
-        # 根据时间或其他特征动态调整权重
-        if time_features is not None:
-            hour = time_features.get('hour', None)
-            month = time_features.get('month', None)
-            
-            # 根据一天中的时间调整
-            if hour is not None:
-                # 示例：深度学习模型在白天表现更好，树模型在夜晚更可靠
-                if isinstance(hour, (int, float)):
-                    # 单个值
-                    if 8 <= hour <= 16:  # 白天
-                        weights[0:3] *= 1.2  # 增加神经网络模型权重
-                    else:  # 夜晚/早晨/傍晚
-                        weights[3:] *= 1.2  # 增加树模型权重
-                else:
-                    # 数组值
-                    for i, h in enumerate(hour):
-                        if 8 <= h <= 16:
-                            for j in range(min(3, len(weights))):
-                                weights[j] *= 1.2
-                        else:
-                            for j in range(3, len(weights)):
-                                weights[j] *= 1.2
-            
-            # 根据季节调整
-            if month is not None:
-                # 示例：不同季节调整权重
-                if isinstance(month, (int, float)):
-                    # 春夏秋冬不同模型表现不同
-                    if 3 <= month <= 5:  # 春季
-                        weights[0] *= 1.2  # 假设第一个模型在春季表现更好
-                    elif 6 <= month <= 8:  # 夏季
-                        weights[1] *= 1.2  # 假设第二个模型在夏季表现更好
-                    elif 9 <= month <= 11:  # 秋季
-                        weights[2] *= 1.2
-                    else:  # 冬季
-                        weights[3] *= 1.2
-        
-        # 重新归一化权重
-        weights = weights / np.sum(weights)
-        
-        # 加权组合预测结果
-        predictions = np.vstack(predictions)
-        weighted_pred = np.sum(predictions.T * weights, axis=1).reshape(-1, 1)
-        
-        return weighted_pred
 
 # 改进的特征提取函数，加入更高级的物理特征和统计特征
 def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365, hour_of_day=None):
@@ -1785,7 +1555,7 @@ def enhanced_extract_features(nwp_data, is_wind_farm=True, num_days=365, hour_of
                     features_dict[f'{key}_trend_24h'] = trend
     
     # 2. 极端值特征
-    for key in features_dict:
+    for key in list(features_dict.keys()):  # Iterate over a copy of keys
         if isinstance(features_dict[key], np.ndarray) and features_dict[key].ndim > 1:
             feature = features_dict[key]
             # 计算极端值：95%分位数和5%分位数
@@ -2043,26 +1813,22 @@ def train_advanced(farm_id):
 
 # 主程序执行
 farms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-use_advanced_training = True  # 设置为True使用高级训练方法，实现0.9准确率目标
+use_advanced_training = True  # 设置为True使用高级训练方法
 
 for farm_id in farms:
     try:
         print(f"\n==== Processing farm {farm_id} ====")
         
-        # 选择训练方法
-        if use_advanced_training:
-            print("Using train_for_high_accuracy for high accuracy goal...")
-            model = train_for_high_accuracy(farm_id)
-        else:
-            print("Using standard train function...")
-            model = train(farm_id)
+        # 训练模型
+        print("Using simplified high accuracy training...")
+        model = train_for_high_accuracy(farm_id)
         
         # 保存模型
         model_path = f'models/{farm_id}'
         os.makedirs(model_path, exist_ok=True)
-        model_name = 'baseline_middle_school.pkl'  # 与原始代码保持一致的名称
+        model_name = 'baseline_middle_school.pkl'
         
-        print(f"Saving {'enhanced' if use_advanced_training else 'standard'} model for farm {farm_id}")
+        print(f"Saving model for farm {farm_id}")
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model, f)
         
@@ -2150,76 +1916,5 @@ for farm_id in farms:
             
         except Exception as e2:
             print(f"Fallback model also failed for farm {farm_id}: {str(e2)}")
-            
-            # 最后的补救措施 - 生成简单模式
-            try:
-                print(f"Generating simple pattern for farm {farm_id}")
-                is_wind_farm = farm_id <= 5
-                dates = pd.date_range(datetime(1969, 1, 1, 0), datetime(1969, 1, 31, 23, 45), freq='15min')
-                
-                if is_wind_farm:
-                    # 风电场：创建基本的周期性模式
-                    hours = np.array([d.hour for d in dates])
-                    days = np.array([d.day for d in dates])
-                    
-                    # 更高级的周期性模式，包含日变化和天变化
-                    base = 0.4 + 0.2 * np.sin(hours * np.pi / 12) + 0.1 * np.sin(days * np.pi / 15)
-                    
-                    # 添加随机噪声
-                    random = np.random.rand(len(dates)) * 0.2
-                    values = base + random
-                    values = np.clip(values, 0.05, 0.95)  # 确保值在合理范围内且不为零
-                else:
-                    # 太阳能电场：创建更精确的日间钟形曲线
-                    hours = np.array([d.hour + d.minute/60 for d in dates])
-                    days = np.array([d.day for d in dates])
-                    
-                    # 太阳高度角模拟(简化版)
-                    values = np.zeros(len(dates))
-                    
-                    # 6:00到18:00之间是有效发电时间
-                    day_minutes = (hours >= 6) & (hours <= 18)
-                    
-                    # 创建钟形曲线，加入季节变化
-                    for i in range(len(dates)):
-                      if day_minutes[i]:
-                        # 计算太阳高度角（简化）
-                        sun_angle = np.zeros(len(dates))
-                        for i, (hour, day) in enumerate(zip(hours, days)):
-                            if 6 <= hour <= 18:  # 白天
-                                # 模拟太阳高度角
-                                time_factor = -((hour - 12) / 6) ** 2 + 1  # 最大值在中午
-                                day_factor = np.sin(day * np.pi / 31)  # 月内变化
-                                sun_angle[i] = time_factor * (0.8 + 0.2 * day_factor)
-                        
-                        # 模拟云层遮挡
-                        cloud_effect = np.ones(len(dates))
-                        # 随机生成多云天
-                        cloudy_days = np.random.choice(range(1, 32), size=10, replace=False)
-                        for day in cloudy_days:
-                            day_indices = np.where(np.array([d.day for d in dates]) == day)[0]
-                            cloud_effect[day_indices] = 0.3 + 0.4 * np.random.rand()
-                        
-                        # 应用云层效应和随机波动
-                        values = sun_angle * cloud_effect
-                        
-                        # 确保夜间为0
-                        night_mask = (hours < 6) | (hours > 18)
-                        values[night_mask] = 0
-                    
-                    # 保存结果
-                    res = pd.Series(values, index=dates)
-                    result_path = f'result/output'
-                    os.makedirs(result_path, exist_ok=True)
-                    res.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
-                    print(f"Created simple pattern for farm {farm_id}")
-                    
-            except Exception as e3:
-                    print(f"All methods failed for farm {farm_id}: {str(e3)}")
 
-    print('All farms processed')
-
-
-# 示例使用:
-# 要使用以上高级函数实现0.9准确率，可以将主程序中的train函数替换为train_for_high_accuracy
-# model = train_for_high_accuracy(farm_id)
+print('All farms processed')
