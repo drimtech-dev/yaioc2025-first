@@ -10,6 +10,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
 
 # Define better PyTorch model with residual connections
 class EnhancedModel(nn.Module):
@@ -123,26 +125,75 @@ def add_time_features(df):
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12.0)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12.0)
     
-    # Derived features for hour of day
+    # More refined time periods
     df['is_daytime'] = ((df['hour'] >= 6) & (df['hour'] <= 18)).astype(int)
+    df['is_peak_sun'] = ((df['hour'] >= 10) & (df['hour'] <= 15)).astype(int)
+    df['is_transition'] = (((df['hour'] >= 5) & (df['hour'] < 7)) | 
+                           ((df['hour'] >= 17) & (df['hour'] < 19))).astype(int)
+    
+    # Season features (astronomical seasons)
+    df['season'] = df['month'].apply(lambda m: 0 if m in [12, 1, 2] else  # Winter
+                                         1 if m in [3, 4, 5] else  # Spring
+                                         2 if m in [6, 7, 8] else  # Summer
+                                         3)  # Fall
+    df['season_sin'] = np.sin(2 * np.pi * df['season'] / 4.0)
+    df['season_cos'] = np.cos(2 * np.pi * df['season'] / 4.0)
+    
+    # Day of week
+    df['dayofweek'] = df.index.dayofweek
+    df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
+    
+    # Interaction features
+    df['day_month_sin'] = np.sin(2 * np.pi * (df['day'] + 31 * (df['month'] - 1)) / 365.0)
+    df['day_month_cos'] = np.cos(2 * np.pi * (df['day'] + 31 * (df['month'] - 1)) / 365.0)
     
     return df
 
 def add_wind_features(u_data, v_data, feature_prefix):
-    """Add specialized wind features"""
+    """Add specialized wind features with physics-based derivations"""
     # Wind speed
     ws = np.sqrt(u_data ** 2 + v_data ** 2)
     ws_df = pd.DataFrame(ws, columns=[f"{feature_prefix}_ws_{i}" for i in range(ws.shape[1])])
     
-    # Wind direction
-    wd = np.arctan2(v_data, u_data) * 180 / np.pi
+    # Wind direction in degrees (0-360)
+    wd = (np.arctan2(v_data, u_data) * 180 / np.pi) % 360
     wd_df = pd.DataFrame(wd, columns=[f"{feature_prefix}_wd_{i}" for i in range(wd.shape[1])])
     
-    # Wind power is proportional to wind speed cubed
+    # Wind power is proportional to wind speed cubed (fundamental physics relationship)
     ws_cubed = ws ** 3
     ws_cubed_df = pd.DataFrame(ws_cubed, columns=[f"{feature_prefix}_ws3_{i}" for i in range(ws_cubed.shape[1])])
     
-    return pd.concat([ws_df, wd_df, ws_cubed_df], axis=1)
+    # Add wind speed squared (related to dynamic pressure)
+    ws_squared = ws ** 2
+    ws_squared_df = pd.DataFrame(ws_squared, columns=[f"{feature_prefix}_ws2_{i}" for i in range(ws_squared.shape[1])])
+    
+    # Wind speed variability (std of 9 grid points, proxy for turbulence)
+    ws_std = np.std(ws, axis=1).reshape(-1, 1)
+    ws_std_df = pd.DataFrame(ws_std, columns=[f"{feature_prefix}_ws_std"])
+    
+    # Wind direction variability (circular standard deviation, proxy for directional stability)
+    # Using approximation via resultant vector length
+    sin_wd = np.sin(np.radians(wd))
+    cos_wd = np.cos(np.radians(wd))
+    mean_sin = np.mean(sin_wd, axis=1).reshape(-1, 1)
+    mean_cos = np.mean(cos_wd, axis=1).reshape(-1, 1)
+    resultant_length = np.sqrt(mean_sin**2 + mean_cos**2)
+    dir_stability = resultant_length  # 1 = perfectly aligned, 0 = completely scattered
+    dir_stability_df = pd.DataFrame(dir_stability, columns=[f"{feature_prefix}_dir_stability"])
+    
+    # Wind shear approximation (difference between max and min wind speed in grid)
+    wind_shear = (np.max(ws, axis=1) - np.min(ws, axis=1)).reshape(-1, 1)
+    wind_shear_df = pd.DataFrame(wind_shear, columns=[f"{feature_prefix}_wind_shear"])
+    
+    # Directionally weighted wind speed (project wind to main farm axis, typically along prevailing wind direction)
+    # Assuming cardinal directions as examples (can be refined with actual farm data)
+    ns_component = np.abs(v_data).mean(axis=1).reshape(-1, 1)  # North-South component
+    ew_component = np.abs(u_data).mean(axis=1).reshape(-1, 1)  # East-West component
+    ns_df = pd.DataFrame(ns_component, columns=[f"{feature_prefix}_ns_wind"])
+    ew_df = pd.DataFrame(ew_component, columns=[f"{feature_prefix}_ew_wind"])
+    
+    return pd.concat([ws_df, wd_df, ws_squared_df, ws_cubed_df, ws_std_df, 
+                      dir_stability_df, wind_shear_df, ns_df, ew_df], axis=1)
 
 def train(farm_id):
     # Determine if wind (1-5) or solar (6-10) farm
@@ -193,18 +244,59 @@ def train(farm_id):
                                   channel=['tcc']).data.values.reshape(365 * 24, 9)
                 tcc_df = pd.DataFrame(tcc, columns=[f"{nwp}_tcc_{i}" for i in range(tcc.shape[1])])
                 
-                # Calculate average GHI and maximum GHI as additional features
+                # Get temperature if available (affects panel efficiency)
+                if 't2m' in nwp_data.channel:
+                    t2m = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                      channel=['t2m']).data.values.reshape(365 * 24, 9)
+                    t2m_df = pd.DataFrame(t2m, columns=[f"{nwp}_t2m_{i}" for i in range(t2m.shape[1])])
+                    
+                    # Convert to Celsius if in Kelvin (assuming t2m is in Kelvin)
+                    if t2m.mean() > 100:  # Simple check if likely in Kelvin
+                        for col in t2m_df.columns:
+                            t2m_df[col] = t2m_df[col] - 273.15
+                    
+                    # Panel temperature estimation (simplified model)
+                    # Panel temp is typically 20-30°C higher than ambient when under full sun
+                    panel_temp_cols = []
+                    for i in range(t2m.shape[1]):
+                        col_name = f"{nwp}_panel_temp_{i}"
+                        # Higher GHI = higher panel temp above ambient
+                        ghi_col = f"{nwp}_ghi_{i}"
+                        t2m_col = f"{nwp}_t2m_{i}"
+                        panel_temp = t2m_df[t2m_col] + 25 * (ghi_df[ghi_col] / (ghi_df[ghi_col].max() + 1e-6))
+                        t2m_df[col_name] = panel_temp
+                        panel_temp_cols.append(col_name)
+                    
+                    # Panel efficiency factor (efficiency decreases with temperature)
+                    # Typical temp coefficient is -0.4% per °C above 25°C
+                    for col in panel_temp_cols:
+                        eff_col = f"{col}_eff_factor"
+                        t2m_df[eff_col] = 1.0 - 0.004 * np.maximum(0, t2m_df[col] - 25)
+                
+                # GHI features
                 avg_ghi = np.mean(ghi, axis=1).reshape(-1, 1)
                 max_ghi = np.max(ghi, axis=1).reshape(-1, 1)
+                std_ghi = np.std(ghi, axis=1).reshape(-1, 1)  # Measure of spatial variability
                 avg_ghi_df = pd.DataFrame(avg_ghi, columns=[f"{nwp}_avg_ghi"])
                 max_ghi_df = pd.DataFrame(max_ghi, columns=[f"{nwp}_max_ghi"])
+                std_ghi_df = pd.DataFrame(std_ghi, columns=[f"{nwp}_std_ghi"])
                 
-                # Calculate ratio of actual GHI to clear sky GHI (proxy using max value)
-                # This helps identify cloud effects
+                # Cloud cover impact
+                avg_tcc = np.mean(tcc, axis=1).reshape(-1, 1)
+                tcc_impact = 1.0 - 0.7 * avg_tcc  # Simple model: clear sky (0) = 100%, overcast (1) = 30%
+                tcc_impact_df = pd.DataFrame(tcc_impact, columns=[f"{nwp}_tcc_impact"])
+                
+                # Clear sky index (GHI ratio)
                 ghi_ratio = ghi / (max_ghi + 1e-6)
                 ghi_ratio_df = pd.DataFrame(ghi_ratio, columns=[f"{nwp}_ghi_ratio_{i}" for i in range(ghi_ratio.shape[1])])
                 
-                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, ghi_ratio_df], axis=1)
+                # Combine all features
+                if 't2m' in nwp_data.channel:
+                    nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, std_ghi_df,
+                                      tcc_impact_df, ghi_ratio_df, t2m_df], axis=1)
+                else:
+                    nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, std_ghi_df,
+                                      tcc_impact_df, ghi_ratio_df], axis=1)
             else:
                 # Fallback to basic features
                 u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
@@ -267,115 +359,188 @@ def train(farm_id):
             if col not in top_features:
                 top_features.append(col)
     
-    # Use only selected features
-    x_processed = x_processed[top_features]
+    # Use only selected features if provided
+    if top_features:
+        # Ensure all required features exist, create with zeros if missing
+        missing_features = [feature for feature in top_features if feature not in x_df.columns]
+        if missing_features:
+            # Create a DataFrame with zeros for all missing features at once
+            missing_df = pd.DataFrame(0, index=x_df.index, columns=missing_features)
+            # Concatenate with original DataFrame
+            x_df = pd.concat([x_df, missing_df], axis=1)
+        x_df = x_df[top_features]
     
-    # Select the best model based on farm type
+    # Create a train/validation split for model evaluation
+    X_train, X_val, y_train, y_val = train_test_split(
+        x_processed.values, y_processed.values.ravel(), 
+        test_size=0.15, random_state=42
+    )
+    
+    # Simple ensemble approach - train multiple models with different settings
     if is_wind_farm:
-        # For wind farms, optimize GradientBoostingRegressor parameters
-        model = GradientBoostingRegressor(
-            n_estimators=300,    # Increase from 200
-            learning_rate=0.05,  # Decrease from 0.1 for more stability
-            max_depth=6,         # Slight increase from 5
-            min_samples_split=5,
-            min_samples_leaf=3,  # Increase from 2 for robustness
-            max_features='sqrt',
-            subsample=0.9,       # Add subsampling for better generalization
+        # For wind farms, use both Gradient Boosting and Random Forest
+        models = []
+        
+        # Model 1: GradientBoostingRegressor with optimized parameters
+        gb_model = GradientBoostingRegressor(
+            n_estimators=350,
+            learning_rate=0.04,
+            max_depth=7,
+            min_samples_split=6,
+            min_samples_leaf=4,
+            max_features=0.8,
+            subsample=0.85,
             random_state=42
         )
-        model.fit(x_processed.values, y_processed.values.ravel())
-        return model, top_features
-    else:
-        # For solar farms, optimize RandomForestRegressor parameters
-        model = RandomForestRegressor(
-            n_estimators=300,    # Increase from 200
-            max_depth=12,        # Slight increase from 10
-            min_samples_split=4, # Slight decrease from 5
-            min_samples_leaf=2,
-            max_features=0.7,    # Use fraction instead of 'sqrt' for better feature coverage
+        gb_model.fit(X_train, y_train)
+        models.append(gb_model)
+        
+        # Model 2: RandomForestRegressor as a complementary model
+        rf_model = RandomForestRegressor(
+            n_estimators=300,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            max_features=0.7,
             bootstrap=True,
-            oob_score=True,      # Use out-of-bag estimation
+            random_state=43  # Different seed
+        )
+        rf_model.fit(X_train, y_train)
+        models.append(rf_model)
+        
+        # Calculate weights based on validation performance
+        # Using 1 - abs_rel_error as the metric (higher is better)
+        weights = []
+        for model in models:
+            preds = model.predict(X_val)
+            # Calculate rel error where possible (avoid div by zero)
+            mask = y_val > 1e-6
+            if np.sum(mask) > 0:
+                rel_error = np.mean(np.abs(preds[mask] - y_val[mask]) / y_val[mask])
+                weights.append(max(0, 1 - rel_error))  # Higher weight for better models
+            else:
+                weights.append(1.0)  # Default weight
+        
+        # Normalize weights to sum to 1
+        total = sum(weights)
+        if total > 0:
+            weights = [w/total for w in weights]
+        else:
+            weights = [1.0/len(models)] * len(models)
+        
+        # Build a simple weighted ensemble class
+        class WeightedEnsemble:
+            def __init__(self, models, weights):
+                self.models = models
+                self.weights = weights
+            
+            def predict(self, X):
+                preds = np.zeros((X.shape[0],))
+                for model, weight in zip(self.models, self.weights):
+                    preds += weight * model.predict(X)
+                return preds
+        
+        ensemble_model = WeightedEnsemble(models, weights)
+        
+        # Verify ensemble performance is better than individual models
+        ensemble_preds = ensemble_model.predict(X_val)
+        best_individual_score = max(weights)
+        
+        # Calculate ensemble score
+        mask = y_val > 1e-6
+        if np.sum(mask) > 0:
+            ensemble_error = np.mean(np.abs(ensemble_preds[mask] - y_val[mask]) / y_val[mask])
+            ensemble_score = 1 - ensemble_error
+        else:
+            ensemble_score = 1.0
+        
+        # If ensemble is worse than best model, use best model instead
+        if ensemble_score < best_individual_score - 0.02:  # Only switch if significantly worse
+            best_model_idx = weights.index(max(weights))
+            return models[best_model_idx], top_features
+        
+        return ensemble_model, top_features
+    else:
+        # For solar farms, similar ensemble approach
+        models = []
+        
+        # Model 1: RandomForestRegressor with optimized parameters
+        rf_model = RandomForestRegressor(
+            n_estimators=400,
+            max_depth=14,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            max_features=0.75,
+            bootstrap=True,
+            oob_score=True,
             n_jobs=-1,
             random_state=42
         )
-        model.fit(x_processed.values, y_processed.values.ravel())
-        return model, top_features
-    
-    # Neural network approach (as fallback)
-    # Convert to PyTorch tensors
-    X = torch.tensor(x_processed.values, dtype=torch.float32)
-    y = torch.tensor(y_processed.values, dtype=torch.float32)
-    
-    # Create dataset and dataloader
-    dataset = TensorDataset(X, y)
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-    
-    # Initialize model
-    input_dim = X.shape[1]
-    
-    # Use different architectures based on farm type
-    if is_wind_farm:
-        model = EnhancedModel(input_dim, hidden_dims=[256, 128, 64])
-    else:
-        model = EnhancedModel(input_dim, hidden_dims=[192, 96, 64])
-    
-    # Use custom loss function
-    criterion = PowerForecastLoss(alpha=0.7)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    
-    # Learning rate scheduler with warm-up
-    def lr_lambda(epoch):
-        if epoch < 5:  # Warm-up phase
-            return 0.2 + 0.8 * epoch / 5
-        else:  # Decay phase
-            return 1.0 * (0.95 ** (epoch - 5))
-    
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Training loop
-    num_epochs = 200
-    best_loss = float('inf')
-    best_model = None
-    patience = 10
-    patience_counter = 0
-    
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
+        rf_model.fit(X_train, y_train)
+        models.append(rf_model)
         
-        for inputs, targets in dataloader:
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            running_loss += loss.item()
+        # Model 2: GradientBoostingRegressor as complementary model
+        gb_model = GradientBoostingRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=8,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            max_features=0.7,
+            subsample=0.9,
+            random_state=43  # Different seed
+        )
+        gb_model.fit(X_train, y_train)
+        models.append(gb_model)
         
-        epoch_loss = running_loss / len(dataloader)
-        scheduler.step()
+        # Calculate weights based on validation performance
+        weights = []
+        for model in models:
+            preds = model.predict(X_val)
+            mask = y_val > 1e-6
+            if np.sum(mask) > 0:
+                rel_error = np.mean(np.abs(preds[mask] - y_val[mask]) / y_val[mask])
+                weights.append(max(0, 1 - rel_error))
+            else:
+                weights.append(1.0)
         
-        # Save the best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            best_model = model.state_dict().copy()
-            patience_counter = 0
+        # Normalize weights
+        total = sum(weights)
+        if total > 0:
+            weights = [w/total for w in weights]
         else:
-            patience_counter += 1
+            weights = [1.0/len(models)] * len(models)
         
-        # Early stopping with patience
-        if patience_counter >= patience:
-            break
-    
-    # Load the best model
-    model.load_state_dict(best_model)
-    return model, top_features
+        # Build weighted ensemble
+        class WeightedEnsemble:
+            def __init__(self, models, weights):
+                self.models = models
+                self.weights = weights
+            
+            def predict(self, X):
+                preds = np.zeros((X.shape[0],))
+                for model, weight in zip(self.models, self.weights):
+                    preds += weight * model.predict(X)
+                return preds
+        
+        ensemble_model = WeightedEnsemble(models, weights)
+        
+        # Verify ensemble performance
+        ensemble_preds = ensemble_model.predict(X_val)
+        best_individual_score = max(weights)
+        
+        mask = y_val > 1e-6
+        if np.sum(mask) > 0:
+            ensemble_error = np.mean(np.abs(ensemble_preds[mask] - y_val[mask]) / y_val[mask])
+            ensemble_score = 1 - ensemble_error
+        else:
+            ensemble_score = 1.0
+        
+        if ensemble_score < best_individual_score - 0.02:
+            best_model_idx = weights.index(max(weights))
+            return models[best_model_idx], top_features
+        
+        return ensemble_model, top_features
 
 def predict(model, farm_id, top_features=None):
     # Determine if wind or solar farm
@@ -470,9 +635,12 @@ def predict(model, farm_id, top_features=None):
     # Use only selected features if provided
     if top_features:
         # Ensure all required features exist, create with zeros if missing
-        for feature in top_features:
-            if feature not in x_df.columns:
-                x_df[feature] = 0
+        missing_features = [feature for feature in top_features if feature not in x_df.columns]
+        if missing_features:
+            # Create a DataFrame with zeros for all missing features at once
+            missing_df = pd.DataFrame(0, index=x_df.index, columns=missing_features)
+            # Concatenate with original DataFrame
+            x_df = pd.concat([x_df, missing_df], axis=1)
         x_df = x_df[top_features]
     
     # Make predictions
@@ -529,31 +697,81 @@ def predict(model, farm_id, top_features=None):
         hours = res.index.hour
         month = res.index.month
         
-        # Create masks for different seasons - apply element-wise comparison
+        # Create more precise seasonal boundaries for dusk/dawn times
         winter_mask = month.isin([11, 12, 1, 2])
+        spring_mask = month.isin([3, 4])
         summer_mask = month.isin([5, 6, 7, 8])
+        fall_mask = month.isin([9, 10])
         
-        # Apply night hours based on season for each timestamp
-        night_mask_winter = (hours >= 18) | (hours <= 6)
-        night_mask_summer = (hours >= 20) | (hours <= 4)
-        night_mask_default = (hours >= 19) | (hours <= 5)
+        # More precise night hours based on season
+        night_mask_winter = (hours >= 17) | (hours <= 7)  # Shorter days in winter
+        night_mask_spring = (hours >= 19) | (hours <= 6)  # Transition season
+        night_mask_summer = (hours >= 21) | (hours <= 5)  # Longer days in summer
+        night_mask_fall = (hours >= 18) | (hours <= 6)    # Transition season
         
-        # Apply masks - where True for both season and night condition
+        # Apply masks with bitwise operations
         res[winter_mask & night_mask_winter] = 0
+        res[spring_mask & night_mask_spring] = 0
         res[summer_mask & night_mask_summer] = 0
-        res[~winter_mask & ~summer_mask & night_mask_default] = 0
+        res[fall_mask & night_mask_fall] = 0
         
-        # Smoother transitions at dawn/dusk (adjust production gradually)
-        for hour in [5, 6, 19, 20]:
-            dawn_dusk_mask = res.index.hour == hour
-            if sum(dawn_dusk_mask) > 0:
-                minute = res.index[dawn_dusk_mask].minute
-                if hour in [5, 6]:  # Dawn - gradually increase
-                    factor = minute / 60 if hour == 6 else (minute + 60) / 120
-                    res[dawn_dusk_mask] = res[dawn_dusk_mask] * factor
-                else:  # Dusk - gradually decrease
-                    factor = (60 - minute) / 60 if hour == 19 else (120 - minute) / 120
-                    res[dawn_dusk_mask] = res[dawn_dusk_mask] * factor
+        # Create more realistic dawn/dusk transitions based on season
+        # Winter dawn (gradual 2-hour transition)
+        for hour in range(6, 9):
+            dawn_mask = winter_mask & (res.index.hour == hour)
+            if sum(dawn_mask) > 0:
+                minute = res.index[dawn_mask].minute
+                # Gradual ramp up over 2 hours
+                factor = ((hour - 6) * 60 + minute) / 120
+                factor = np.minimum(1.0, factor)  # Cap at 1.0
+                res[dawn_mask] = res[dawn_mask] * factor
+        
+        # Winter dusk (gradual transition)
+        for hour in range(15, 18):
+            dusk_mask = winter_mask & (res.index.hour == hour)
+            if sum(dusk_mask) > 0:
+                minute = res.index[dusk_mask].minute
+                # Gradual ramp down
+                factor = (17 * 60 + 60 - (hour * 60 + minute)) / 120
+                factor = np.maximum(0.0, factor)  # Floor at 0.0
+                res[dusk_mask] = res[dusk_mask] * factor
+        
+        # Summer dawn (gradual transition)
+        for hour in range(4, 7):
+            dawn_mask = summer_mask & (res.index.hour == hour)
+            if sum(dawn_mask) > 0:
+                minute = res.index[dawn_mask].minute
+                factor = ((hour - 4) * 60 + minute) / 120
+                factor = np.minimum(1.0, factor)
+                res[dawn_mask] = res[dawn_mask] * factor
+        
+        # Summer dusk (gradual transition)
+        for hour in range(19, 22):
+            dusk_mask = summer_mask & (res.index.hour == hour)
+            if sum(dusk_mask) > 0:
+                minute = res.index[dusk_mask].minute
+                factor = (21 * 60 + 60 - (hour * 60 + minute)) / 120
+                factor = np.maximum(0.0, factor)
+                res[dusk_mask] = res[dusk_mask] * factor
+        
+        # Spring and Fall (intermediate transitions)
+        # Dawn
+        for hour in range(5, 8):
+            dawn_mask = (spring_mask | fall_mask) & (res.index.hour == hour)
+            if sum(dawn_mask) > 0:
+                minute = res.index[dawn_mask].minute
+                factor = ((hour - 5) * 60 + minute) / 120
+                factor = np.minimum(1.0, factor)
+                res[dawn_mask] = res[dawn_mask] * factor
+        
+        # Dusk
+        for hour in range(17, 20):
+            dusk_mask = (spring_mask | fall_mask) & (res.index.hour == hour)
+            if sum(dusk_mask) > 0:
+                minute = res.index[dusk_mask].minute
+                factor = (19 * 60 + 60 - (hour * 60 + minute)) / 120
+                factor = np.maximum(0.0, factor)
+                res[dusk_mask] = res[dusk_mask] * factor
     
     return res
 
@@ -585,7 +803,144 @@ for farm_id in farms:
         print(f"Error processing farm {farm_id}: {str(e)}")
         # Fallback to simple linear model if enhanced model fails
         # This ensures we always have a prediction
-        from sklearn.linear_model import LinearRegression
         print(f"Falling back to linear model for farm {farm_id}")
+        
+        # Load data again for fallback model
+        is_wind_farm = farm_id <= 5
+        
+        # Simplified data processing for fallback
+        x_df = pd.DataFrame()
+        nwp_test_path = f'training/middle_school/TEST/nwp_data_test/{farm_id}'
+        
+        for nwp in nwps:
+            nwp_path = os.path.join(nwp_test_path, nwp)
+            nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
+            
+            if is_wind_farm:
+                u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                channel=['u100']).data.values.reshape(31 * 24, 9)
+                v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                channel=['v100']).data.values.reshape(31 * 24, 9)
+                
+                ws = np.sqrt(u ** 2 + v ** 2)
+                ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
+                ws_mean = np.mean(ws, axis=1).reshape(-1, 1)
+                ws_mean_df = pd.DataFrame(ws_mean, columns=[f"{nwp}_ws_mean"])
+                
+                nwp_df = pd.concat([ws_df, ws_mean_df], axis=1)
+            else:
+                if 'ghi' in nwp_data.channel:
+                    ghi = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                       channel=['ghi']).data.values.reshape(31 * 24, 9)
+                    ghi_df = pd.DataFrame(ghi, columns=[f"{nwp}_ghi_{i}" for i in range(ghi.shape[1])])
+                    ghi_mean = np.mean(ghi, axis=1).reshape(-1, 1)
+                    ghi_mean_df = pd.DataFrame(ghi_mean, columns=[f"{nwp}_ghi_mean"])
+                    
+                    nwp_df = pd.concat([ghi_df, ghi_mean_df], axis=1)
+                else:
+                    # If no GHI, use wind as proxy (less ideal but better than nothing)
+                    u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                    channel=['u100']).data.values.reshape(31 * 24, 9)
+                    v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                    channel=['v100']).data.values.reshape(31 * 24, 9)
+                    ws = np.sqrt(u ** 2 + v ** 2)
+                    ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
+                    nwp_df = pd.concat([ws_df], axis=1)
+            
+            x_df = pd.concat([x_df, nwp_df], axis=1)
+        
+        x_df.index = pd.date_range(datetime(1969, 1, 1, 0), datetime(1969, 1, 31, 23), freq='h')
+        
+        # Add basic time features
+        x_df['hour'] = x_df.index.hour
+        x_df['hour_sin'] = np.sin(2 * np.pi * x_df['hour'] / 24.0)
+        x_df['hour_cos'] = np.cos(2 * np.pi * x_df['hour'] / 24.0)
+        x_df['month'] = x_df.index.month
+        x_df['day'] = x_df.index.day
+        x_df['is_daytime'] = ((x_df['hour'] >= 6) & (x_df['hour'] <= 18)).astype(int)
+        
+        # Load training data for the linear model
+        nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
+        x_train_df = pd.DataFrame()
+        
+        for nwp in nwps:
+            nwp_path = os.path.join(nwp_train_path, nwp)
+            nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
+            
+            if is_wind_farm:
+                u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                channel=['u100']).data.values.reshape(365 * 24, 9)
+                v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                channel=['v100']).data.values.reshape(365 * 24, 9)
+                
+                ws = np.sqrt(u ** 2 + v ** 2)
+                ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
+                ws_mean = np.mean(ws, axis=1).reshape(-1, 1)
+                ws_mean_df = pd.DataFrame(ws_mean, columns=[f"{nwp}_ws_mean"])
+                
+                nwp_df = pd.concat([ws_df, ws_mean_df], axis=1)
+            else:
+                if 'ghi' in nwp_data.channel:
+                    ghi = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                       channel=['ghi']).data.values.reshape(365 * 24, 9)
+                    ghi_df = pd.DataFrame(ghi, columns=[f"{nwp}_ghi_{i}" for i in range(ghi.shape[1])])
+                    ghi_mean = np.mean(ghi, axis=1).reshape(-1, 1)
+                    ghi_mean_df = pd.DataFrame(ghi_mean, columns=[f"{nwp}_ghi_mean"])
+                    
+                    nwp_df = pd.concat([ghi_df, ghi_mean_df], axis=1)
+                else:
+                    u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                    channel=['u100']).data.values.reshape(365 * 24, 9)
+                    v = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
+                                    channel=['v100']).data.values.reshape(365 * 24, 9)
+                    ws = np.sqrt(u ** 2 + v ** 2)
+                    ws_df = pd.DataFrame(ws, columns=[f"{nwp}_ws_{i}" for i in range(ws.shape[1])])
+                    nwp_df = pd.concat([ws_df], axis=1)
+            
+            x_train_df = pd.concat([x_train_df, nwp_df], axis=1)
+        
+        x_train_df.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
+        
+        # Add basic time features
+        x_train_df['hour'] = x_train_df.index.hour
+        x_train_df['hour_sin'] = np.sin(2 * np.pi * x_train_df['hour'] / 24.0)
+        x_train_df['hour_cos'] = np.cos(2 * np.pi * x_train_df['hour'] / 24.0)
+        x_train_df['month'] = x_train_df.index.month
+        x_train_df['day'] = x_train_df.index.day
+        x_train_df['is_daytime'] = ((x_train_df['hour'] >= 6) & (x_train_df['hour'] <= 18)).astype(int)
+        
+        # Get target data
+        y_train_df = pd.read_csv(os.path.join(fact_path, f'{farm_id}_normalization_train.csv'), index_col=0)
+        y_train_df.index = pd.to_datetime(y_train_df.index)
+        y_train_df.columns = ['power']
+        
+        # Align data
+        x_train_df, y_train_df = data_preprocess(x_train_df, y_train_df)
+        y_train_df[y_train_df < 0] = 0
+        
+        # Train simple linear model
+        fallback_model = LinearRegression()
+        fallback_model.fit(x_train_df.values, y_train_df.values)
+        
+        # Make predictions
+        fallback_pred = fallback_model.predict(x_df.values)
+        fallback_pred[fallback_pred < 0] = 0
+        fallback_pred[fallback_pred > 1] = 1
+        
+        # Format predictions
+        fallback_series = pd.Series(fallback_pred.flatten(), 
+                                   index=pd.date_range(x_df.index[0], periods=len(fallback_pred), freq='h'))
+        
+        # Resample to 15-min intervals
+        fallback_res = fallback_series.resample('15min').interpolate(method='linear')
+        
+        # For solar farms, zero out nighttime values
+        if not is_wind_farm:
+            hours = fallback_res.index.hour
+            fallback_res[((hours >= 20) | (hours <= 5))] = 0
+        
+        # Save fallback predictions
+        fallback_res.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
+        print(f'Fallback model completed for farm {farm_id}')
         
 print('All farms processed')
