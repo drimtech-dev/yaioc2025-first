@@ -9,7 +9,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LassoCV, RidgeCV
 from sklearn.preprocessing import StandardScaler
+import time
+import multiprocessing as mp
+from functools import partial
 
 # Define better PyTorch model with residual connections
 class EnhancedModel(nn.Module):
@@ -142,7 +146,56 @@ def add_wind_features(u_data, v_data, feature_prefix):
     ws_cubed = ws ** 3
     ws_cubed_df = pd.DataFrame(ws_cubed, columns=[f"{feature_prefix}_ws3_{i}" for i in range(ws_cubed.shape[1])])
     
-    return pd.concat([ws_df, wd_df, ws_cubed_df], axis=1)
+    # Calculate wind variability (standard deviation of wind speeds)
+    ws_std = np.std(ws, axis=1).reshape(-1, 1)
+    ws_std_df = pd.DataFrame(ws_std, columns=[f"{feature_prefix}_ws_std"])
+    
+    # Calculate wind direction variability
+    wd_std = np.std(wd, axis=1).reshape(-1, 1)
+    wd_std_df = pd.DataFrame(wd_std, columns=[f"{feature_prefix}_wd_std"])
+    
+    # Add wind shear proxy (variation of wind speed across grid points)
+    ws_max = np.max(ws, axis=1).reshape(-1, 1)
+    ws_min = np.min(ws, axis=1).reshape(-1, 1)
+    ws_shear = (ws_max - ws_min) / (ws_max + 1e-6)
+    ws_shear_df = pd.DataFrame(ws_shear, columns=[f"{feature_prefix}_ws_shear"])
+    
+    return pd.concat([ws_df, wd_df, ws_cubed_df, ws_std_df, wd_std_df, ws_shear_df], axis=1)
+
+def create_ensemble_model(x_processed, y_processed, is_wind_farm):
+    """Create a simplified model for better prediction and avoid feature mismatch"""
+    print(f"Training with {x_processed.shape[1]} features")
+    
+    if is_wind_farm:
+        # For wind farms, use GradientBoostingRegressor
+        print("Training GradientBoostingRegressor for wind farm...")
+        model = GradientBoostingRegressor(
+            n_estimators=150,     # More trees for better accuracy
+            learning_rate=0.08,   # Slightly lower learning rate for stability
+            max_depth=5,          # Moderate depth to avoid overfitting
+            min_samples_split=4,
+            min_samples_leaf=2,
+            max_features=0.8,     # Use most features
+            subsample=0.9,        # Use most of the data
+            random_state=42
+        )
+        model.fit(x_processed.values, y_processed.values.ravel())
+        
+    else:  # Solar farm
+        # For solar farms, use RandomForestRegressor
+        print("Training RandomForestRegressor for solar farm...")
+        model = RandomForestRegressor(
+            n_estimators=150,    # More trees for better accuracy
+            max_depth=8,         # Moderate depth to avoid overfitting
+            min_samples_split=3,
+            min_samples_leaf=2,
+            max_features=0.8,    # Use most features
+            n_jobs=-1,           # Use all cores
+            random_state=42
+        )
+        model.fit(x_processed.values, y_processed.values.ravel())
+    
+    return model
 
 def train(farm_id):
     # Determine if wind (1-5) or solar (6-10) farm
@@ -204,7 +257,17 @@ def train(farm_id):
                 ghi_ratio = ghi / (max_ghi + 1e-6)
                 ghi_ratio_df = pd.DataFrame(ghi_ratio, columns=[f"{nwp}_ghi_ratio_{i}" for i in range(ghi_ratio.shape[1])])
                 
-                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, ghi_ratio_df], axis=1)
+                # Calculate standard deviation of GHI (indicates variability)
+                std_ghi = np.std(ghi, axis=1).reshape(-1, 1)
+                std_ghi_df = pd.DataFrame(std_ghi, columns=[f"{nwp}_std_ghi"])
+                
+                # Calculate cloud coverage impact (using TCC)
+                # Higher TCC means more clouds, which usually means less solar power
+                cloud_impact = (1 - np.mean(tcc, axis=1)).reshape(-1, 1) * avg_ghi
+                cloud_impact_df = pd.DataFrame(cloud_impact, columns=[f"{nwp}_cloud_impact"])
+                
+                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, 
+                                   ghi_ratio_df, std_ghi_df, cloud_impact_df], axis=1)
             else:
                 # Fallback to basic features
                 u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
@@ -247,59 +310,47 @@ def train(farm_id):
     x_processed, y_processed = data_preprocess(x_df, y_df)
     y_processed[y_processed < 0] = 0
     
-    # Feature selection based on correlation with target (simple but effective)
+    # Feature selection based on correlation and importance
     correlations = []
     for col in x_processed.columns:
         corr = np.abs(np.corrcoef(x_processed[col], y_processed['power'])[0, 1])
         if not np.isnan(corr):  # Avoid NaN correlations
             correlations.append((col, corr))
     
-    # Sort by correlation and keep top features (70% for wind, 60% for solar)
+    # Sort by correlation and keep top features
     correlations.sort(key=lambda x: x[1], reverse=True)
-    if is_wind_farm:
-        top_features = [col for col, _ in correlations[:int(len(correlations)*0.7)]]
-    else:
-        top_features = [col for col, _ in correlations[:int(len(correlations)*0.6)]]
     
-    # Keep important time features regardless of correlation
-    for col in x_processed.columns:
-        if any(time_feat in col for time_feat in ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos', 'is_daytime']):
-            if col not in top_features:
-                top_features.append(col)
+    # Select features more intelligently based on farm type
+    if is_wind_farm:
+        # For wind farms, we want more features related to wind speed and direction
+        wind_features = [col for col, _ in correlations if any(term in col for term in ['_ws_', '_wd_', '_ws3_', 'tcc'])]
+        top_corr_features = [col for col, corr in correlations if corr > 0.3]  # Use correlation threshold instead of percentage
+        top_features = list(set(wind_features + top_corr_features))
+    else:
+        # For solar farms, we want more features related to solar radiation and cloud cover
+        solar_features = [col for col, _ in correlations if any(term in col for term in ['ghi', 'poai', 'tcc', 'cloud_impact'])]
+        top_corr_features = [col for col, corr in correlations if corr > 0.3]  # Use correlation threshold instead of percentage
+        top_features = list(set(solar_features + top_corr_features))
+    
+    # Always keep important time features
+    time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos', 'is_daytime']
+    for feature in time_features:
+        if feature in x_processed.columns and feature not in top_features:
+            top_features.append(feature)
     
     # Use only selected features
+    print(f"Selected {len(top_features)} features out of {x_processed.shape[1]} available features")
     x_processed = x_processed[top_features]
     
     # Select the best model based on farm type
     if is_wind_farm:
-        # For wind farms, optimize GradientBoostingRegressor parameters
-        model = GradientBoostingRegressor(
-            n_estimators=300,    # Increase from 200
-            learning_rate=0.05,  # Decrease from 0.1 for more stability
-            max_depth=6,         # Slight increase from 5
-            min_samples_split=5,
-            min_samples_leaf=3,  # Increase from 2 for robustness
-            max_features='sqrt',
-            subsample=0.9,       # Add subsampling for better generalization
-            random_state=42
-        )
-        model.fit(x_processed.values, y_processed.values.ravel())
-        return model, top_features
+        # For wind farms, use ensemble model
+        ensemble = create_ensemble_model(x_processed, y_processed, is_wind_farm=True)
+        return ensemble, top_features
     else:
-        # For solar farms, optimize RandomForestRegressor parameters
-        model = RandomForestRegressor(
-            n_estimators=300,    # Increase from 200
-            max_depth=12,        # Slight increase from 10
-            min_samples_split=4, # Slight decrease from 5
-            min_samples_leaf=2,
-            max_features=0.7,    # Use fraction instead of 'sqrt' for better feature coverage
-            bootstrap=True,
-            oob_score=True,      # Use out-of-bag estimation
-            n_jobs=-1,
-            random_state=42
-        )
-        model.fit(x_processed.values, y_processed.values.ravel())
-        return model, top_features
+        # For solar farms, use ensemble model
+        ensemble = create_ensemble_model(x_processed, y_processed, is_wind_farm=False)
+        return ensemble, top_features
     
     # Neural network approach (as fallback)
     # Convert to PyTorch tensors
@@ -432,7 +483,17 @@ def predict(model, farm_id, top_features=None):
                 ghi_ratio = ghi / (max_ghi + 1e-6)
                 ghi_ratio_df = pd.DataFrame(ghi_ratio, columns=[f"{nwp}_ghi_ratio_{i}" for i in range(ghi_ratio.shape[1])])
                 
-                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, ghi_ratio_df], axis=1)
+                # Calculate standard deviation of GHI (indicates variability)
+                std_ghi = np.std(ghi, axis=1).reshape(-1, 1)
+                std_ghi_df = pd.DataFrame(std_ghi, columns=[f"{nwp}_std_ghi"])
+                
+                # Calculate cloud coverage impact (using TCC)
+                # Higher TCC means more clouds, which usually means less solar power
+                cloud_impact = (1 - np.mean(tcc, axis=1)).reshape(-1, 1) * avg_ghi
+                cloud_impact_df = pd.DataFrame(cloud_impact, columns=[f"{nwp}_cloud_impact"])
+                
+                nwp_df = pd.concat([ghi_df, poai_df, tcc_df, avg_ghi_df, max_ghi_df, 
+                                   ghi_ratio_df, std_ghi_df, cloud_impact_df], axis=1)
             else:
                 u = nwp_data.sel(lat=range(4,7), lon=range(4,7), lead_time=range(24),
                                 channel=['u100']).data.values.reshape(31 * 24, 9)
@@ -470,13 +531,24 @@ def predict(model, farm_id, top_features=None):
     # Use only selected features if provided
     if top_features:
         # Ensure all required features exist, create with zeros if missing
-        for feature in top_features:
-            if feature not in x_df.columns:
-                x_df[feature] = 0
+        missing_features = [feature for feature in top_features if feature not in x_df.columns]
+        
+        # Create missing features with zeros
+        for feature in missing_features:
+            x_df[feature] = 0
+            print(f"Warning: Created missing feature {feature} with zeros")
+            
+        # Keep only the features used during training
         x_df = x_df[top_features]
     
+    # Verify feature count
+    if hasattr(model, 'n_features_in_'):
+        expected_features = model.n_features_in_
+        if x_df.shape[1] != expected_features:
+            print(f"Feature mismatch: model expecting {expected_features} features, but got {x_df.shape[1]}")
+    
     # Make predictions
-    if isinstance(model, (GradientBoostingRegressor, RandomForestRegressor)):
+    if isinstance(model, (GradientBoostingRegressor, RandomForestRegressor, RidgeCV)):
         pred_pw = model.predict(x_df.values)
     else:
         # PyTorch model
@@ -488,34 +560,35 @@ def predict(model, farm_id, top_features=None):
     # Post-processing for smoother predictions
     pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
     
-    # Apply smoothing with weighted moving average before resampling
-    # This helps reduce noise in predictions while preserving important patterns
+    # Apply adaptive smoothing based on farm type
     if is_wind_farm:
-        # Wind power can fluctuate rapidly, use 3-hour window with more weight on central value
-        window_size = 3
-        weights = np.array([0.2, 0.6, 0.2]) # More weight on current hour
+        # For wind farms, use adaptive window based on variability
+        # Calculate rolling standard deviation to detect high variability periods
+        rolling_std = pred.rolling(window=3, min_periods=1).std()
         
-        # Apply smoothing only if we have enough data points
-        if len(pred) >= window_size:
-            smoothed_values = np.convolve(pred.values, weights, mode='same')
-            # Fix the edges (first and last points have no full window)
-            smoothed_values[0] = pred.values[0] * 0.8 + pred.values[1] * 0.2
-            smoothed_values[-1] = pred.values[-2] * 0.2 + pred.values[-1] * 0.8
-            pred = pd.Series(smoothed_values, index=pred.index)
+        # Apply stronger smoothing to high-variability periods
+        for i in range(1, len(pred)-1):
+            if rolling_std.iloc[i] > 0.1:  # High variability threshold
+                # Apply stronger smoothing for highly variable periods
+                pred.iloc[i] = 0.2 * pred.iloc[i-1] + 0.6 * pred.iloc[i] + 0.2 * pred.iloc[i+1]
+            else:
+                # Apply lighter smoothing for stable periods
+                pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
     else:
-        # Solar power has more regular daily patterns, use slightly larger window
-        window_size = 5
-        weights = np.array([0.1, 0.2, 0.4, 0.2, 0.1]) # More weight on central value
-        
-        # Apply smoothing only if we have enough data points
-        if len(pred) >= window_size:
-            smoothed_values = np.convolve(pred.values, weights, mode='same')
-            # Fix the edges
-            smoothed_values[0] = pred.values[0] * 0.7 + pred.values[1] * 0.3
-            smoothed_values[1] = pred.values[0] * 0.2 + pred.values[1] * 0.5 + pred.values[2] * 0.3
-            smoothed_values[-2] = pred.values[-3] * 0.3 + pred.values[-2] * 0.5 + pred.values[-1] * 0.2
-            smoothed_values[-1] = pred.values[-2] * 0.3 + pred.values[-1] * 0.7
-            pred = pd.Series(smoothed_values, index=pred.index)
+        # For solar farms, preserve the daily pattern better
+        for i in range(1, len(pred)-1):
+            hour = pred.index[i].hour
+            
+            # Apply different smoothing based on time of day
+            if 5 <= hour <= 8 or 16 <= hour <= 19:  # Dawn/dusk transition periods
+                # Stronger smoothing during transition periods
+                pred.iloc[i] = 0.25 * pred.iloc[i-1] + 0.5 * pred.iloc[i] + 0.25 * pred.iloc[i+1]
+            elif 9 <= hour <= 15:  # Midday (peak production)
+                # Lighter smoothing during peak production
+                pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
+            else:  # Night
+                # Medium smoothing at night
+                pred.iloc[i] = 0.2 * pred.iloc[i-1] + 0.6 * pred.iloc[i] + 0.2 * pred.iloc[i+1]
     
     # Apply smoother interpolation for 15min intervals
     res = pred.resample('15min').interpolate(method='cubic')
@@ -534,9 +607,9 @@ def predict(model, farm_id, top_features=None):
         summer_mask = month.isin([5, 6, 7, 8])
         
         # Apply night hours based on season for each timestamp
-        night_mask_winter = (hours >= 18) | (hours <= 6)
-        night_mask_summer = (hours >= 20) | (hours <= 4)
-        night_mask_default = (hours >= 19) | (hours <= 5)
+        night_mask_winter = (hours >= 17) | (hours <= 7)  # Updated winter hours
+        night_mask_summer = (hours >= 20) | (hours <= 5)  # Updated summer hours
+        night_mask_default = (hours >= 19) | (hours <= 6)  # Updated default hours
         
         # Apply masks - where True for both season and night condition
         res[winter_mask & night_mask_winter] = 0
@@ -544,48 +617,129 @@ def predict(model, farm_id, top_features=None):
         res[~winter_mask & ~summer_mask & night_mask_default] = 0
         
         # Smoother transitions at dawn/dusk (adjust production gradually)
-        for hour in [5, 6, 19, 20]:
+        for hour, is_winter, is_summer in [(5, True, False), (6, True, False), (7, True, False), 
+                                          (8, True, False), (17, True, False), (18, True, False),
+                                          (5, False, True), (6, False, True), 
+                                          (19, False, True), (20, False, True)]:
+            
             dawn_dusk_mask = res.index.hour == hour
             if sum(dawn_dusk_mask) > 0:
                 minute = res.index[dawn_dusk_mask].minute
-                if hour in [5, 6]:  # Dawn - gradually increase
-                    factor = minute / 60 if hour == 6 else (minute + 60) / 120
-                    res[dawn_dusk_mask] = res[dawn_dusk_mask] * factor
-                else:  # Dusk - gradually decrease
-                    factor = (60 - minute) / 60 if hour == 19 else (120 - minute) / 120
-                    res[dawn_dusk_mask] = res[dawn_dusk_mask] * factor
+                season_mask = winter_mask if is_winter else (summer_mask if is_summer else ~winter_mask & ~summer_mask)
+                combined_mask = dawn_dusk_mask & season_mask
+                
+                if combined_mask.sum() > 0:
+                    if hour in [5, 6, 7, 8]:  # Dawn - gradually increase
+                        if hour == 5:
+                            factor = minute / 120
+                        elif hour == 6:
+                            factor = (minute + 60) / 120
+                        elif hour == 7:
+                            factor = (minute + 120) / 180
+                        else:  # hour == 8
+                            factor = (minute + 180) / 240
+                        res[combined_mask] = res[combined_mask] * factor
+                    else:  # Dusk - gradually decrease
+                        if hour == 17:
+                            factor = (120 - minute) / 120
+                        elif hour == 18:
+                            factor = (60 - minute) / 120
+                        elif hour == 19:
+                            factor = (60 - minute) / 60
+                        else:  # hour == 20
+                            factor = (30 - minute) / 60
+                            factor = np.maximum(factor, 0)  # Ensure non-negative
+                        res[combined_mask] = res[combined_mask] * factor
+        
+        # Add cap to maximum production based on time of day
+        midday_mask = (hours >= 10) & (hours <= 14)
+        morning_mask = (hours >= 7) & (hours < 10)
+        afternoon_mask = (hours > 14) & (hours <= 17)
+        
+        # Reduce production during non-peak hours
+        res[morning_mask] = res[morning_mask] * 0.9
+        res[afternoon_mask] = res[afternoon_mask] * 0.85
     
     return res
 
-acc = pd.DataFrame()
-farms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-
-for farm_id in farms:
+def process_farm(farm_id):
+    """Process a single farm - for parallel processing"""
+    farm_start_time = time.time()
     model_path = f'models/{farm_id}'
     os.makedirs(model_path, exist_ok=True)
     model_name = 'enhanced_model.pkl'
     features_name = 'features.pkl'
     
     try:
+        print(f"\n===== Processing farm {farm_id} =====")
+        print(f"Training model for farm {farm_id}...")
         model, top_features = train(farm_id)
         
         # Save the model and selected features
+        print(f"Saving model for farm {farm_id}...")
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model, f)
         
         with open(os.path.join(model_path, features_name), "wb") as f:
             pickle.dump(top_features, f)
         
+        print(f"Making predictions for farm {farm_id}...")
         pred = predict(model, farm_id, top_features)
         result_path = f'result/output'
         os.makedirs(result_path, exist_ok=True)
         pred.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
-        print(f'Successfully processed farm {farm_id}')
+        farm_time = time.time() - farm_start_time
+        print(f'Successfully processed farm {farm_id} in {farm_time:.2f} seconds')
+        return farm_id, True
     except Exception as e:
         print(f"Error processing farm {farm_id}: {str(e)}")
-        # Fallback to simple linear model if enhanced model fails
-        # This ensures we always have a prediction
-        from sklearn.linear_model import LinearRegression
-        print(f"Falling back to linear model for farm {farm_id}")
-        
-print('All farms processed')
+        return farm_id, False
+
+# Main execution
+if __name__ == "__main__":
+    acc = pd.DataFrame()
+    # Process all farms now that the approach is verified
+    farms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    
+    # Start timing
+    total_start_time = time.time()
+    
+    # Option 1: Sequential processing
+    # for farm_id in farms:
+    #     process_farm(farm_id)
+    
+    # Option 2: Parallel processing with multiprocessing
+    # Determine number of cores to use (max 4 to avoid memory issues)
+    num_cores = min(4, mp.cpu_count())
+    print(f"Using {num_cores} cores for parallel processing")
+    
+    # Create a pool of workers
+    with mp.Pool(processes=num_cores) as pool:
+        # Map process_farm to all farm_ids in parallel
+        results = pool.map(process_farm, farms)
+    
+    # Calculate total time
+    total_time = time.time() - total_start_time
+    
+    # Count successful farms
+    successful = sum(1 for _, success in results if success)
+    print(f"{successful} out of {len(farms)} farms successfully processed")
+    print(f'All farms processed in {total_time:.2f} seconds ({total_time/60:.2f} minutes)')
+    
+    # Play sound alert when finished (try multiple methods for different systems)
+    try:
+        # For Linux/Unix systems
+        os.system('for i in {1..5}; do echo -e "\a"; sleep 0.5; done')
+        # For Windows systems
+        os.system('powershell -c "(New-Object Media.SoundPlayer).PlaySync([System.IO.Path]::Combine([System.Environment]::SystemDirectory, \'media\\Windows Notify.wav\'))"')
+        # Alternative method for Windows
+        os.system('echo \x07\x07\x07\x07\x07')
+    except:
+        # Fallback if above methods fail
+        import sys
+        for _ in range(5):
+            sys.stdout.write('\a')
+            sys.stdout.flush()
+            time.sleep(0.5)
+    
+    print("\n处理完成！所有农场数据处理完毕！", flush=True)
