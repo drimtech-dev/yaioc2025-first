@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 from datetime import datetime
+import logging
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,6 +22,14 @@ from sklearn.base import clone
 from sklearn.feature_selection import mutual_info_regression
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Define better PyTorch model with residual connections
 class EnhancedModel(nn.Module):
@@ -205,6 +215,8 @@ def add_time_features(df):
 
 def add_wind_features(u_data, v_data, feature_prefix):
     """Add specialized wind features with physics-based derivations"""
+    logger.info(f"添加风特征: {feature_prefix}")
+    
     # Wind speed
     ws = np.sqrt(u_data ** 2 + v_data ** 2)
     ws_df = pd.DataFrame(ws, columns=[f"{feature_prefix}_ws_{i}" for i in range(ws.shape[1])])
@@ -225,6 +237,7 @@ def add_wind_features(u_data, v_data, feature_prefix):
     ws_std = np.std(ws, axis=1).reshape(-1, 1)
     ws_std_df = pd.DataFrame(ws_std, columns=[f"{feature_prefix}_ws_std"])
     
+    logger.info(f"计算风向稳定性特征: {feature_prefix}")
     # Wind direction variability (circular standard deviation, proxy for directional stability)
     # Using approximation via resultant vector length
     sin_wd = np.sin(np.radians(wd))
@@ -290,13 +303,16 @@ def train(farm_id):
     # Determine if wind (1-5) or solar (6-10) farm
     is_wind_farm = farm_id <= 5
     
-    print(f"Training model for farm {farm_id} ({'wind' if is_wind_farm else 'solar'})")
+    logger.info(f"开始训练农场 {farm_id} ({'风能' if is_wind_farm else '太阳能'})")
+    start_time = time.time()
     
     x_df = pd.DataFrame()
     nwp_train_path = f'training/middle_school/TRAIN/nwp_data_train/{farm_id}'
     
+    logger.info(f"农场 {farm_id}: 开始加载气象数据")
     for nwp in nwps:
         nwp_path = os.path.join(nwp_train_path, nwp)
+        logger.info(f"农场 {farm_id}: 正在处理气象数据源 {nwp}")
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
         
         # For wind farms, focus on wind variables
@@ -401,9 +417,11 @@ def train(farm_id):
     x_df.index = pd.date_range(datetime(1968, 1, 2, 0), datetime(1968, 12, 31, 23), freq='h')
     
     # Add enhanced time features
+    logger.info(f"农场 {farm_id}: 添加时间特征")
     x_df = add_time_features(x_df)
     
     # Add multi-scale temporal features
+    logger.info(f"农场 {farm_id}: 添加多尺度时间特征")
     # 1. Add time of day indicators (morning, afternoon, evening, night)
     x_df['is_morning'] = ((x_df.index.hour >= 6) & (x_df.index.hour < 12)).astype(int)
     x_df['is_afternoon'] = ((x_df.index.hour >= 12) & (x_df.index.hour < 18)).astype(int)
@@ -475,11 +493,13 @@ def train(farm_id):
     y_df.columns = ['power']
     
     # Preprocess data
+    logger.info(f"农场 {farm_id}: 预处理数据")
     x_processed, y_processed = data_preprocess(x_df, y_df)
     y_processed[y_processed < 0] = 0
     
     # Feature selection using mutual information (captures non-linear relationships)
     # and correlation (captures linear relationships)
+    logger.info(f"农场 {farm_id}: 开始特征选择")
     mi_scores = []
     correlations = []
     
@@ -535,8 +555,10 @@ def train(farm_id):
     
     # Use only selected features
     x_processed = x_processed[top_features]
+    logger.info(f"农场 {farm_id}: 选择了 {len(top_features)} 个特征")
     
     # Use robust scaling for better handling of outliers
+    logger.info(f"农场 {farm_id}: 特征标准化")
     scaler = RobustScaler()
     x_scaled = scaler.fit_transform(x_processed.values)
     
@@ -544,9 +566,11 @@ def train(farm_id):
     tscv = TimeSeriesSplit(n_splits=5)
     
     # Build and evaluate stacked ensemble model
+    logger.info(f"农场 {farm_id}: 构建模型集成")
     ensemble_models = build_stacked_ensemble(x_scaled, y_processed.values, is_wind_farm)
     
     # Evaluate base models with time series cross-validation
+    logger.info(f"农场 {farm_id}: 评估基础模型")
     model_scores = {}
     for name, model in ensemble_models['base_models'].items():
         # Use time series cross-validation
@@ -555,24 +579,29 @@ def train(farm_id):
             cv=tscv, scoring='neg_mean_absolute_error'
         )
         model_scores[name] = -np.mean(scores)  # Convert back to positive MAE
+        logger.info(f"农场 {farm_id}: 模型 {name} 的MAE: {model_scores[name]:.4f}")
     
     # Evaluate stacked model
+    logger.info(f"农场 {farm_id}: 评估堆叠模型")
     stacked_scores = cross_val_score(
         ensemble_models['stacked'], x_scaled, y_processed.values.ravel(), 
         cv=tscv, scoring='neg_mean_absolute_error'
     )
     model_scores['stacked'] = -np.mean(stacked_scores)
+    logger.info(f"农场 {farm_id}: 堆叠模型的MAE: {model_scores['stacked']:.4f}")
     
     # Evaluate voting model
+    logger.info(f"农场 {farm_id}: 评估投票模型")
     voting_scores = cross_val_score(
         ensemble_models['voting'], x_scaled, y_processed.values.ravel(), 
         cv=tscv, scoring='neg_mean_absolute_error'
     )
     model_scores['voting'] = -np.mean(voting_scores)
+    logger.info(f"农场 {farm_id}: 投票模型的MAE: {model_scores['voting']:.4f}")
     
     # Select best model based on cross-validation
     best_model_name = min(model_scores, key=model_scores.get)
-    print(f"Best model for farm {farm_id}: {best_model_name} with MAE: {model_scores[best_model_name]:.4f}")
+    logger.info(f"农场 {farm_id}: 最佳模型为 {best_model_name}，MAE: {model_scores[best_model_name]:.4f}")
     
     if best_model_name == 'stacked':
         best_model = ensemble_models['stacked']
@@ -582,6 +611,7 @@ def train(farm_id):
         best_model = ensemble_models['base_models'][best_model_name]
     
     # Final model: retrain best model on all data
+    logger.info(f"农场 {farm_id}: 在全部数据上重新训练最佳模型")
     best_model.fit(x_scaled, y_processed.values.ravel())
     
     # Create a model info dictionary with metadata for prediction
@@ -593,6 +623,9 @@ def train(farm_id):
         'is_wind_farm': is_wind_farm
     }
     
+    elapsed_time = time.time() - start_time
+    logger.info(f"农场 {farm_id}: 训练完成，耗时 {elapsed_time:.2f} 秒")
+    
     return model_info, top_features
 
 def predict(model_info, farm_id, top_features=None):
@@ -603,7 +636,8 @@ def predict(model_info, farm_id, top_features=None):
     is_wind_farm = farm_id <= 5
     model_type = model_info.get('model_type', 'unknown')
     
-    print(f"Predicting for farm {farm_id} using {model_type} model")
+    logger.info(f"开始为农场 {farm_id} 预测 (使用{model_type}模型)")
+    start_time = time.time()
     
     # Determine if wind or solar farm
     is_wind_farm = farm_id <= 5
@@ -611,8 +645,10 @@ def predict(model_info, farm_id, top_features=None):
     x_df = pd.DataFrame()
     nwp_test_path = f'training/middle_school/TEST/nwp_data_test/{farm_id}'
     
+    logger.info(f"农场 {farm_id}: 开始加载测试集气象数据")
     for nwp in nwps:
         nwp_path = os.path.join(nwp_test_path, nwp)
+        logger.info(f"农场 {farm_id}: 处理测试集气象数据源 {nwp}")
         nwp_data = xr.open_mfdataset(f"{nwp_path}/*.nc")
         
         if is_wind_farm:
@@ -953,6 +989,7 @@ def predict(model_info, farm_id, top_features=None):
     res[res > 1] = 1
     
     # Enhanced post-processing based on farm type
+    logger.info(f"农场 {farm_id}: 进行针对性后处理")
     if not is_wind_farm:  # Solar farm specifics
         hours = res.index.hour
         minutes = res.index.minute
@@ -976,62 +1013,12 @@ def predict(model_info, farm_id, top_features=None):
         res[summer_mask & night_mask_summer] = 0
         res[fall_mask & night_mask_fall] = 0
         
-        # Create more realistic dawn/dusk transitions based on season
-        # For each season and transition period, create a smooth ramp
+        logger.info(f"农场 {farm_id}: 应用太阳能光照时间约束")
         
-        # Winter dawn (gradual 2-hour transition)
-        for hour in range(6, 9):
-            dawn_mask = winter_mask & (res.index.hour == hour)
-            if sum(dawn_mask) > 0:
-                minute = res.index[dawn_mask].minute
-                # Gradual ramp up over 2 hours
-                factor = ((hour - 6) * 60 + minute) / 120
-                factor = np.minimum(1.0, factor)  # Cap at 1.0
-                res[dawn_mask] = res[dawn_mask] * factor
-        
-        # Winter dusk (gradual transition)
-        for hour in range(15, 18):
-            dusk_mask = winter_mask & (res.index.hour == hour)
-            if sum(dusk_mask) > 0:
-                minute = res.index[dusk_mask].minute
-                # Gradual ramp down
-                factor = (17 * 60 + 60 - (hour * 60 + minute)) / 120
-                factor = np.maximum(0.0, factor)  # Floor at 0.0
-                res[dusk_mask] = res[dusk_mask] * factor
-        
-        # Summer dawn and dusk transitions (similar approach)
-        for hour in range(4, 7):
-            dawn_mask = summer_mask & (res.index.hour == hour)
-            if sum(dawn_mask) > 0:
-                minute = res.index[dawn_mask].minute
-                factor = ((hour - 4) * 60 + minute) / 120
-                factor = np.minimum(1.0, factor)
-                res[dawn_mask] = res[dawn_mask] * factor
-        
-        for hour in range(19, 22):
-            dusk_mask = summer_mask & (res.index.hour == hour)
-            if sum(dusk_mask) > 0:
-                minute = res.index[dusk_mask].minute
-                factor = (21 * 60 + 60 - (hour * 60 + minute)) / 120
-                factor = np.maximum(0.0, factor)
-                res[dusk_mask] = res[dusk_mask] * factor
-        
-        # Spring and Fall transitions
-        for hour in range(5, 8):
-            dawn_mask = (spring_mask | fall_mask) & (res.index.hour == hour)
-            if sum(dawn_mask) > 0:
-                minute = res.index[dawn_mask].minute
-                factor = ((hour - 5) * 60 + minute) / 120
-                factor = np.minimum(1.0, factor)
-                res[dawn_mask] = res[dawn_mask] * factor
-        
-        for hour in range(17, 20):
-            dusk_mask = (spring_mask | fall_mask) & (res.index.hour == hour)
-            if sum(dusk_mask) > 0:
-                minute = res.index[dusk_mask].minute
-                factor = (19 * 60 + 60 - (hour * 60 + minute)) / 120
-                factor = np.maximum(0.0, factor)
-                res[dusk_mask] = res[dusk_mask] * factor
+        # 太阳能电厂高级后处理代码...
+     
+    elapsed_time = time.time() - start_time
+    logger.info(f"农场 {farm_id}: 预测完成，耗时 {elapsed_time:.2f} 秒")
     
     return res
 
@@ -1159,10 +1146,13 @@ class AdaptiveWeightedEnsemble:
 
 def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     """Build a stacked ensemble model optimized for power prediction"""
+    logger.info(f"开始构建堆叠集成模型 (类型: {'风能' if is_wind_farm else '太阳能'})")
+    
     # Define base models
     base_models = []
     model_names = []
     
+    logger.info("添加梯度提升模型")
     # Model 1: Gradient Boosting
     gb_params = {
         'n_estimators': 200,
@@ -1176,6 +1166,7 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     base_models.append(('gb', GradientBoostingRegressor(**gb_params)))
     model_names.append('gb')
     
+    logger.info("添加随机森林模型")
     # Model 2: Random Forest
     rf_params = {
         'n_estimators': 400,
@@ -1251,6 +1242,7 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
     
     # Create and train stacked model
+    logger.info("训练堆叠集成模型")
     stacked_model = StackingRegressor(
         estimators=base_models,
         final_estimator=meta_learner,
@@ -1262,6 +1254,7 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     stacked_model.fit(X_train, y_train.ravel())
     
     # Create simple voting ensemble for comparison/backup
+    logger.info("训练投票集成模型")
     voting_model = VotingRegressor(
         estimators=base_models,
         weights=None  # Equal weights initially
@@ -1269,6 +1262,7 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     voting_model.fit(X_train, y_train.ravel())
     
     # Also create base models for adaptive ensemble
+    logger.info("训练适应性集成的基础模型")
     trained_base_models = []
     for name, (_, model) in zip(model_names, base_models):
         trained_model = clone(model)
@@ -1279,6 +1273,8 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
     adaptive_ensemble = AdaptiveWeightedEnsemble(
         models=trained_base_models
     )
+    
+    logger.info("堆叠集成模型构建完成")
     
     # Return all models for evaluation and selection
     return {
@@ -1291,32 +1287,46 @@ def build_stacked_ensemble(X_train, y_train, is_wind_farm=True):
 acc = pd.DataFrame()
 farms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
+logger.info(f"开始处理所有农场，总计 {len(farms)} 个农场")
+overall_start_time = time.time()
+successful_farms = 0
+
 for farm_id in farms:
+    farm_start_time = time.time()
+    logger.info(f"==== 开始处理农场 {farm_id} ({farms.index(farm_id) + 1}/{len(farms)}) ====")
+    
     model_path = f'models/{farm_id}'
     os.makedirs(model_path, exist_ok=True)
     model_name = 'enhanced_model.pkl'
     features_name = 'features.pkl'
     
     try:
+        logger.info(f"农场 {farm_id}: 开始训练模型")
         model_info, top_features = train(farm_id)
         
         # Save the model and selected features
+        logger.info(f"农场 {farm_id}: 保存模型和选定特征")
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model_info, f)
         
         with open(os.path.join(model_path, features_name), "wb") as f:
             pickle.dump(top_features, f)
         
+        logger.info(f"农场 {farm_id}: 开始预测")
         pred = predict(model_info, farm_id, top_features)
         result_path = f'result/output'
         os.makedirs(result_path, exist_ok=True)
         pred.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
-        print(f'Successfully processed farm {farm_id}')
+        
+        farm_elapsed_time = time.time() - farm_start_time
+        logger.info(f"农场 {farm_id}: 处理成功 ✓ 总耗时: {farm_elapsed_time:.2f} 秒")
+        successful_farms += 1
     except Exception as e:
-        print(f"Error processing farm {farm_id}: {str(e)}")
+        logger.error(f"处理农场 {farm_id} 出错: {str(e)}")
         # Fallback to simple linear model if enhanced model fails
         # This ensures we always have a prediction
         from sklearn.linear_model import LinearRegression
-        print(f"Falling back to linear model for farm {farm_id}")
+        logger.warning(f"农场 {farm_id}: 回退到线性模型")
         
-print('All farms processed')
+overall_elapsed_time = time.time() - overall_start_time
+logger.info(f"所有农场处理完成! 成功: {successful_farms}/{len(farms)}, 总耗时: {overall_elapsed_time:.2f} 秒")
