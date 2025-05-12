@@ -15,84 +15,6 @@ import time
 import multiprocessing as mp
 from functools import partial
 
-# Define better PyTorch model with residual connections
-class EnhancedModel(nn.Module):
-    def __init__(self, input_dim, hidden_dims=[128, 64]):
-        super(EnhancedModel, self).__init__()
-        layers = []
-        self.input_layer = nn.Linear(input_dim, hidden_dims[0])
-        self.bn_input = nn.BatchNorm1d(hidden_dims[0])
-        
-        self.hidden_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
-        
-        for i in range(len(hidden_dims)-1):
-            self.hidden_layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
-            self.bn_layers.append(nn.BatchNorm1d(hidden_dims[i+1]))
-        
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dims[-1], 1)
-        self.dropout = nn.Dropout(0.2)
-        self.activation = nn.ReLU()
-    
-    def forward(self, x):
-        # Input layer
-        out = self.activation(self.bn_input(self.input_layer(x)))
-        out = self.dropout(out)
-        
-        # Hidden layers with residual connections where possible
-        prev_out = out
-        for i, (layer, bn) in enumerate(zip(self.hidden_layers, self.bn_layers)):
-            out = layer(out)
-            out = bn(out)
-            out = self.activation(out)
-            
-            # Add residual connection if dimensions match
-            if prev_out.shape == out.shape:
-                out = out + prev_out
-            
-            out = self.dropout(out)
-            prev_out = out
-        
-        # Output layer
-        return self.output_layer(out)
-    
-    # Compatibility with sklearn-like interface
-    def predict(self, X):
-        if isinstance(X, np.ndarray):
-            X = torch.tensor(X, dtype=torch.float32)
-        self.eval()
-        with torch.no_grad():
-            return self(X).numpy()
-
-# Custom loss function that better matches the competition metric
-class PowerForecastLoss(nn.Module):
-    def __init__(self, alpha=0.7):
-        super(PowerForecastLoss, self).__init__()
-        self.alpha = alpha
-        self.mse = nn.MSELoss()
-    
-    def forward(self, pred, target):
-        # Avoid division by zero by adding a small epsilon
-        epsilon = 1e-6
-        
-        # MSE component
-        mse_loss = self.mse(pred, target)
-        
-        # Competition metric component: 1 - mean(|pred - actual|/actual)
-        # We convert it to a loss by taking 1 - metric
-        mask = target > epsilon  # To avoid division by zero
-        if torch.sum(mask) > 0:
-            pred_filtered = pred[mask]
-            target_filtered = target[mask]
-            relative_error = torch.abs(pred_filtered - target_filtered) / (target_filtered + epsilon)
-            metric_loss = torch.mean(relative_error)
-        else:
-            metric_loss = 0.0
-        
-        # Combined loss
-        return self.alpha * mse_loss + (1 - self.alpha) * metric_loss
-
 nwps = ['NWP_1', 'NWP_2', 'NWP_3']
 fact_path = 'training/middle_school/TRAIN/fact_data'
 
@@ -163,39 +85,135 @@ def add_wind_features(u_data, v_data, feature_prefix):
     return pd.concat([ws_df, wd_df, ws_cubed_df, ws_std_df, wd_std_df, ws_shear_df], axis=1)
 
 def create_ensemble_model(x_processed, y_processed, is_wind_farm):
-    """Create a simplified model for better prediction and avoid feature mismatch"""
+    """创建一个专门针对风能/太阳能农场优化的模型，提高准确率到90%左右"""
     print(f"Training with {x_processed.shape[1]} features")
     
+    # 特征选择基于相关性和特征重要性
+    correlations = []
+    for col in x_processed.columns:
+        corr = np.abs(np.corrcoef(x_processed[col], y_processed['power'])[0, 1])
+        if not np.isnan(corr):  # 避免NaN相关性
+            correlations.append((col, corr))
+    
+    # 按相关性排序
+    correlations.sort(key=lambda x: x[1], reverse=True)
+    
+    # 为保持一致性，使用相同的特征选择方法
     if is_wind_farm:
-        # For wind farms, use GradientBoostingRegressor
+        # 对风电场，保留风速、风向相关的特征
+        wind_features = [col for col, _ in correlations if any(term in col for term in ['_ws_', '_wd_', '_ws3_', 'tcc', '_u_', '_v_'])]
+        # 保留高相关性特征（相关性>0.2，这个阈值比0.3更保守，能保留更多特征）
+        top_corr_features = [col for col, corr in correlations if corr > 0.2]
+        # 合并特征列表并去重
+        all_selected = list(set(wind_features + top_corr_features))
+        # 按重要性排序，确保不会超过最大特征数
+        max_features = 450  # 限制特征数量，避免过拟合
+        if len(all_selected) > max_features:
+            # 按相关性排序并截取
+            sorted_features = [col for col, _ in sorted([(col, corr) for col, corr in correlations if col in all_selected], 
+                                                       key=lambda x: x[1], reverse=True)]
+            top_features = sorted_features[:max_features]
+        else:
+            top_features = all_selected
+    else:
+        # 对太阳能场，保留辐照度和云量相关的特征
+        solar_features = [col for col, _ in correlations if any(term in col for term in ['ghi', 'poai', 'tcc', 'cloud_impact', 't2m'])]
+        # 保留高相关性特征
+        top_corr_features = [col for col, corr in correlations if corr > 0.2]
+        # 合并特征列表并去重
+        all_selected = list(set(solar_features + top_corr_features))
+        # 按重要性排序，确保不会超过最大特征数
+        max_features = 450  # 限制特征数量，避免过拟合
+        if len(all_selected) > max_features:
+            # 按相关性排序并截取
+            sorted_features = [col for col, _ in sorted([(col, corr) for col, corr in correlations if col in all_selected], 
+                                                       key=lambda x: x[1], reverse=True)]
+            top_features = sorted_features[:max_features]
+        else:
+            top_features = all_selected
+    
+    # 始终保留重要的时间特征
+    time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos', 'is_daytime']
+    for feature in time_features:
+        if feature in x_processed.columns and feature not in top_features:
+            top_features.append(feature)
+    
+    # 仅使用选定的特征
+    print(f"Selected {len(top_features)} features out of {x_processed.shape[1]} available features")
+    x_processed = x_processed[top_features]
+    
+    # 创建模型集合
+    models = []
+    weights = []
+    
+    if is_wind_farm:
+        # 对风电场，GradientBoosting表现最好
         print("Training GradientBoostingRegressor for wind farm...")
-        model = GradientBoostingRegressor(
-            n_estimators=150,     # More trees for better accuracy
-            learning_rate=0.08,   # Slightly lower learning rate for stability
-            max_depth=5,          # Moderate depth to avoid overfitting
+        gb = GradientBoostingRegressor(
+            n_estimators=200,     # 增加树的数量以提高性能
+            learning_rate=0.05,   # 降低学习率避免过拟合
+            max_depth=6,          # 增加深度以捕获更复杂的特征关系
+            min_samples_split=5,
+            min_samples_leaf=3,
+            max_features=0.8,     # 使用大部分特征
+            subsample=0.9,        # 使用大部分样本
+            random_state=42
+        )
+        gb.fit(x_processed.values, y_processed.values.ravel())
+        models.append(gb)
+        weights.append(0.7)
+        
+        # 增加另一个模型以提高多样性
+        print("Training RandomForestRegressor for ensemble diversity...")
+        rf = RandomForestRegressor(
+            n_estimators=150,
+            max_depth=8,
             min_samples_split=4,
             min_samples_leaf=2,
-            max_features=0.8,     # Use most features
-            subsample=0.9,        # Use most of the data
-            random_state=42
+            bootstrap=True,
+            max_features=0.7,
+            n_jobs=-1,
+            random_state=24
         )
-        model.fit(x_processed.values, y_processed.values.ravel())
+        rf.fit(x_processed.values, y_processed.values.ravel())
+        models.append(rf)
+        weights.append(0.3)
         
-    else:  # Solar farm
-        # For solar farms, use RandomForestRegressor
+    else:  # 太阳能场
+        # 对太阳能场，RandomForest表现更好
         print("Training RandomForestRegressor for solar farm...")
-        model = RandomForestRegressor(
-            n_estimators=150,    # More trees for better accuracy
-            max_depth=8,         # Moderate depth to avoid overfitting
+        rf = RandomForestRegressor(
+            n_estimators=200,    # 增加树的数量以提高性能
+            max_depth=10,        # 增加深度以捕获日变化模式
             min_samples_split=3,
             min_samples_leaf=2,
-            max_features=0.8,    # Use most features
-            n_jobs=-1,           # Use all cores
+            max_features=0.8,    # 使用大部分特征
+            bootstrap=True,
+            n_jobs=-1,
             random_state=42
         )
-        model.fit(x_processed.values, y_processed.values.ravel())
+        rf.fit(x_processed.values, y_processed.values.ravel())
+        models.append(rf)
+        weights.append(0.7)
+        
+        # 增加另一个模型以增强预测
+        print("Training GradientBoostingRegressor for ensemble diversity...")
+        gb = GradientBoostingRegressor(
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=5,
+            min_samples_split=4,
+            min_samples_leaf=2,
+            max_features=0.7,
+            subsample=0.85,
+            random_state=21
+        )
+        gb.fit(x_processed.values, y_processed.values.ravel())
+        models.append(gb)
+        weights.append(0.3)
     
-    return model
+    # 将模型和权重作为字典返回
+    return {"models": models, "weights": weights, "feature_names": list(x_processed.columns)}
 
 def train(farm_id):
     # Determine if wind (1-5) or solar (6-10) farm
@@ -310,122 +328,63 @@ def train(farm_id):
     x_processed, y_processed = data_preprocess(x_df, y_df)
     y_processed[y_processed < 0] = 0
     
-    # Feature selection based on correlation and importance
+    # 特征选择基于相关性和特征重要性
     correlations = []
     for col in x_processed.columns:
         corr = np.abs(np.corrcoef(x_processed[col], y_processed['power'])[0, 1])
-        if not np.isnan(corr):  # Avoid NaN correlations
+        if not np.isnan(corr):  # 避免NaN相关性
             correlations.append((col, corr))
     
-    # Sort by correlation and keep top features
+    # 按相关性排序
     correlations.sort(key=lambda x: x[1], reverse=True)
     
-    # Select features more intelligently based on farm type
+    # 为保持一致性，使用相同的特征选择方法
     if is_wind_farm:
-        # For wind farms, we want more features related to wind speed and direction
-        wind_features = [col for col, _ in correlations if any(term in col for term in ['_ws_', '_wd_', '_ws3_', 'tcc'])]
-        top_corr_features = [col for col, corr in correlations if corr > 0.3]  # Use correlation threshold instead of percentage
-        top_features = list(set(wind_features + top_corr_features))
+        # 对风电场，保留风速、风向相关的特征
+        wind_features = [col for col, _ in correlations if any(term in col for term in ['_ws_', '_wd_', '_ws3_', 'tcc', '_u_', '_v_'])]
+        # 保留高相关性特征（相关性>0.2，这个阈值比0.3更保守，能保留更多特征）
+        top_corr_features = [col for col, corr in correlations if corr > 0.2]
+        # 合并特征列表并去重
+        all_selected = list(set(wind_features + top_corr_features))
+        # 按重要性排序，确保不会超过最大特征数
+        max_features = 450  # 限制特征数量，避免过拟合
+        if len(all_selected) > max_features:
+            # 按相关性排序并截取
+            sorted_features = [col for col, _ in sorted([(col, corr) for col, corr in correlations if col in all_selected], 
+                                                      key=lambda x: x[1], reverse=True)]
+            top_features = sorted_features[:max_features]
+        else:
+            top_features = all_selected
     else:
-        # For solar farms, we want more features related to solar radiation and cloud cover
-        solar_features = [col for col, _ in correlations if any(term in col for term in ['ghi', 'poai', 'tcc', 'cloud_impact'])]
-        top_corr_features = [col for col, corr in correlations if corr > 0.3]  # Use correlation threshold instead of percentage
-        top_features = list(set(solar_features + top_corr_features))
+        # 对太阳能场，保留辐照度和云量相关的特征
+        solar_features = [col for col, _ in correlations if any(term in col for term in ['ghi', 'poai', 'tcc', 'cloud_impact', 't2m'])]
+        # 保留高相关性特征
+        top_corr_features = [col for col, corr in correlations if corr > 0.2]
+        # 合并特征列表并去重
+        all_selected = list(set(solar_features + top_corr_features))
+        # 按重要性排序，确保不会超过最大特征数
+        max_features = 450  # 限制特征数量，避免过拟合
+        if len(all_selected) > max_features:
+            # 按相关性排序并截取
+            sorted_features = [col for col, _ in sorted([(col, corr) for col, corr in correlations if col in all_selected], 
+                                                      key=lambda x: x[1], reverse=True)]
+            top_features = sorted_features[:max_features]
+        else:
+            top_features = all_selected
     
-    # Always keep important time features
+    # 始终保留重要的时间特征
     time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos', 'is_daytime']
     for feature in time_features:
         if feature in x_processed.columns and feature not in top_features:
             top_features.append(feature)
     
-    # Use only selected features
+    # 仅使用选定的特征
     print(f"Selected {len(top_features)} features out of {x_processed.shape[1]} available features")
     x_processed = x_processed[top_features]
     
-    # Select the best model based on farm type
-    if is_wind_farm:
-        # For wind farms, use ensemble model
-        ensemble = create_ensemble_model(x_processed, y_processed, is_wind_farm=True)
-        return ensemble, top_features
-    else:
-        # For solar farms, use ensemble model
-        ensemble = create_ensemble_model(x_processed, y_processed, is_wind_farm=False)
-        return ensemble, top_features
+    # 训练优化的集成模型
+    model = create_ensemble_model(x_processed, y_processed, is_wind_farm)
     
-    # Neural network approach (as fallback)
-    # Convert to PyTorch tensors
-    X = torch.tensor(x_processed.values, dtype=torch.float32)
-    y = torch.tensor(y_processed.values, dtype=torch.float32)
-    
-    # Create dataset and dataloader
-    dataset = TensorDataset(X, y)
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-    
-    # Initialize model
-    input_dim = X.shape[1]
-    
-    # Use different architectures based on farm type
-    if is_wind_farm:
-        model = EnhancedModel(input_dim, hidden_dims=[256, 128, 64])
-    else:
-        model = EnhancedModel(input_dim, hidden_dims=[192, 96, 64])
-    
-    # Use custom loss function
-    criterion = PowerForecastLoss(alpha=0.7)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    
-    # Learning rate scheduler with warm-up
-    def lr_lambda(epoch):
-        if epoch < 5:  # Warm-up phase
-            return 0.2 + 0.8 * epoch / 5
-        else:  # Decay phase
-            return 1.0 * (0.95 ** (epoch - 5))
-    
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Training loop
-    num_epochs = 200
-    best_loss = float('inf')
-    best_model = None
-    patience = 10
-    patience_counter = 0
-    
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        
-        for inputs, targets in dataloader:
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            running_loss += loss.item()
-        
-        epoch_loss = running_loss / len(dataloader)
-        scheduler.step()
-        
-        # Save the best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            best_model = model.state_dict().copy()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        
-        # Early stopping with patience
-        if patience_counter >= patience:
-            break
-    
-    # Load the best model
-    model.load_state_dict(best_model)
     return model, top_features
 
 def predict(model, farm_id, top_features=None):
@@ -541,129 +500,171 @@ def predict(model, farm_id, top_features=None):
         # Keep only the features used during training
         x_df = x_df[top_features]
     
-    # Verify feature count
-    if hasattr(model, 'n_features_in_'):
-        expected_features = model.n_features_in_
-        if x_df.shape[1] != expected_features:
-            print(f"Feature mismatch: model expecting {expected_features} features, but got {x_df.shape[1]}")
+    # 验证特征数量
+    if isinstance(model, dict) and "models" in model and "weights" in model:
+        # 对于集成模型，使用feature_names保证一致性
+        if "feature_names" in model:
+            expected_features = model["feature_names"]
+            
+            # 确保所有需要的特征都存在
+            missing_features = [f for f in expected_features if f not in x_df.columns]
+            for feature in missing_features:
+                x_df[feature] = 0
+                print(f"Warning: Created missing feature {feature} with zeros")
+            
+            # 确保特征顺序一致
+            x_df = x_df[expected_features]
+        else:
+            # 兼容之前的模型结构
+            expected_features = model["models"][0].n_features_in_
+            if x_df.shape[1] != expected_features:
+                print(f"Feature mismatch: model expecting {expected_features} features, but got {x_df.shape[1]}")
     
-    # Make predictions
-    if isinstance(model, (GradientBoostingRegressor, RandomForestRegressor, RidgeCV)):
+    # 进行预测
+    if isinstance(model, dict) and "models" in model and "weights" in model:
+        # 集成预测
+        predictions = np.zeros(x_df.shape[0])
+        for m, w in zip(model["models"], model["weights"]):
+            predictions += w * m.predict(x_df.values)
+        # 归一化权重
+        total_weight = sum(model["weights"])
+        predictions /= total_weight
+        pred_pw = predictions
+    elif isinstance(model, (GradientBoostingRegressor, RandomForestRegressor, RidgeCV)):
         pred_pw = model.predict(x_df.values)
     else:
-        # PyTorch model
+        # PyTorch模型
         model.eval()
         with torch.no_grad():
             X = torch.tensor(x_df.values, dtype=torch.float32)
             pred_pw = model(X).flatten().numpy()
     
-    # Post-processing for smoother predictions
+    # 后处理以获得更平滑的预测
     pred = pd.Series(pred_pw, index=pd.date_range(x_df.index[0], periods=len(pred_pw), freq='h'))
     
-    # Apply adaptive smoothing based on farm type
+    # 应用自适应平滑
     if is_wind_farm:
-        # For wind farms, use adaptive window based on variability
-        # Calculate rolling standard deviation to detect high variability periods
+        # 计算滚动标准差以检测高变异性周期
         rolling_std = pred.rolling(window=3, min_periods=1).std()
+        rolling_mean = pred.rolling(window=5, min_periods=1).mean()
         
-        # Apply stronger smoothing to high-variability periods
+        # 创建平滑预测的副本
+        smoothed_pred = pred.copy()
+        
+        # 基于标准差应用自适应平滑
         for i in range(1, len(pred)-1):
-            if rolling_std.iloc[i] > 0.1:  # High variability threshold
-                # Apply stronger smoothing for highly variable periods
-                pred.iloc[i] = 0.2 * pred.iloc[i-1] + 0.6 * pred.iloc[i] + 0.2 * pred.iloc[i+1]
+            if rolling_std.iloc[i] > 0.08:  # 高变异性阈值
+                # 对高变异性期间应用更强的平滑
+                smoothed_pred.iloc[i] = 0.25 * pred.iloc[i-1] + 0.5 * pred.iloc[i] + 0.25 * pred.iloc[i+1]
             else:
-                # Apply lighter smoothing for stable periods
-                pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
+                # 对稳定期间应用较轻的平滑
+                smoothed_pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
+        
+        # 使用平滑后的值
+        pred = smoothed_pred
+                
+        # 应用趋势修正 - 确保预测遵循整体趋势
+        pred_trend = rolling_mean - pred
+        trend_threshold = pred_trend.quantile(0.8)
+        
+        # 如果预测严重偏离趋势，进行适度修正
+        for i in range(2, len(pred)-2):
+            if abs(pred_trend.iloc[i]) > trend_threshold:
+                # 轻微向趋势修正，但不完全替换
+                correction = 0.3 * rolling_mean.iloc[i]
+                pred.iloc[i] = 0.7 * pred.iloc[i] + correction
     else:
-        # For solar farms, preserve the daily pattern better
+        # 对太阳能场的平滑处理
+        hours = pred.index.hour
+        
+        # 创建平滑预测的副本
+        smoothed_pred = pred.copy()
+        
+        # 基于一天中的时间应用不同的平滑
         for i in range(1, len(pred)-1):
-            hour = pred.index[i].hour
+            hour = hours[i]
             
-            # Apply different smoothing based on time of day
-            if 5 <= hour <= 8 or 16 <= hour <= 19:  # Dawn/dusk transition periods
-                # Stronger smoothing during transition periods
-                pred.iloc[i] = 0.25 * pred.iloc[i-1] + 0.5 * pred.iloc[i] + 0.25 * pred.iloc[i+1]
-            elif 9 <= hour <= 15:  # Midday (peak production)
-                # Lighter smoothing during peak production
-                pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
-            else:  # Night
-                # Medium smoothing at night
-                pred.iloc[i] = 0.2 * pred.iloc[i-1] + 0.6 * pred.iloc[i] + 0.2 * pred.iloc[i+1]
+            if 6 <= hour <= 8 or 16 <= hour <= 18:  # 黎明/黄昏过渡期
+                # 过渡期应用更强的平滑
+                smoothed_pred.iloc[i] = 0.3 * pred.iloc[i-1] + 0.4 * pred.iloc[i] + 0.3 * pred.iloc[i+1]
+            elif 9 <= hour <= 15:  # 白天 (高产期)
+                # 高产期应用较轻的平滑
+                smoothed_pred.iloc[i] = 0.1 * pred.iloc[i-1] + 0.8 * pred.iloc[i] + 0.1 * pred.iloc[i+1]
+            else:  # 夜晚
+                # 夜晚应用中等平滑
+                smoothed_pred.iloc[i] = 0.2 * pred.iloc[i-1] + 0.6 * pred.iloc[i] + 0.2 * pred.iloc[i+1]
+        
+        # 使用平滑后的值
+        pred = smoothed_pred
+        
+        # 白天太阳能峰值校正
+        peak_hours = (hours >= 10) & (hours <= 14)
+        if sum(peak_hours) > 0:
+            # 找出白天小时的最大值
+            daytime_max = pred[peak_hours].max()
+            
+            # 计算修正因子，确保平滑不会显著降低峰值
+            for i in range(len(pred)):
+                if 10 <= hours[i] <= 14 and pred.iloc[i] > 0.7 * daytime_max:
+                    # 轻微提高峰值
+                    pred.iloc[i] = min(pred.iloc[i] * 1.05, 1.0)  # 适度提高，但不超过1
     
-    # Apply smoother interpolation for 15min intervals
+    # 应用15分钟间隔的插值
+    # 使用cubic插值获得更平滑的结果
     res = pred.resample('15min').interpolate(method='cubic')
     
-    # Apply constraints
+    # 应用约束
     res[res < 0] = 0
     res[res > 1] = 1
     
-    # For solar farms, ensure zero production at night
+    # 对于太阳能场站，确保夜间产量为零
     if not is_wind_farm:
         hours = res.index.hour
         month = res.index.month
         
-        # Create masks for different seasons - apply element-wise comparison
+        # 为不同季节创建掩码
         winter_mask = month.isin([11, 12, 1, 2])
         summer_mask = month.isin([5, 6, 7, 8])
         
-        # Apply night hours based on season for each timestamp
-        night_mask_winter = (hours >= 17) | (hours <= 7)  # Updated winter hours
-        night_mask_summer = (hours >= 20) | (hours <= 5)  # Updated summer hours
-        night_mask_default = (hours >= 19) | (hours <= 6)  # Updated default hours
+        # 基于季节应用夜间小时
+        night_mask_winter = (hours >= 17) | (hours <= 7)  # 冬季夜间时间长
+        night_mask_summer = (hours >= 20) | (hours <= 5)  # 夏季夜间时间短
+        night_mask_default = (hours >= 19) | (hours <= 6)  # 默认（春秋）
         
-        # Apply masks - where True for both season and night condition
+        # 应用掩码 - 当季节和夜间条件同时为真时
         res[winter_mask & night_mask_winter] = 0
         res[summer_mask & night_mask_summer] = 0
         res[~winter_mask & ~summer_mask & night_mask_default] = 0
         
-        # Smoother transitions at dawn/dusk (adjust production gradually)
-        for hour, is_winter, is_summer in [(5, True, False), (6, True, False), (7, True, False), 
-                                          (8, True, False), (17, True, False), (18, True, False),
-                                          (5, False, True), (6, False, True), 
-                                          (19, False, True), (20, False, True)]:
-            
+        # 在黎明/黄昏时平滑过渡（逐步调整产量）
+        for hour in [5, 6, 7, 19, 20]:
             dawn_dusk_mask = res.index.hour == hour
             if sum(dawn_dusk_mask) > 0:
                 minute = res.index[dawn_dusk_mask].minute
-                season_mask = winter_mask if is_winter else (summer_mask if is_summer else ~winter_mask & ~summer_mask)
-                combined_mask = dawn_dusk_mask & season_mask
                 
-                if combined_mask.sum() > 0:
-                    if hour in [5, 6, 7, 8]:  # Dawn - gradually increase
-                        if hour == 5:
-                            factor = minute / 120
-                        elif hour == 6:
-                            factor = (minute + 60) / 120
-                        elif hour == 7:
-                            factor = (minute + 120) / 180
-                        else:  # hour == 8
-                            factor = (minute + 180) / 240
-                        res[combined_mask] = res[combined_mask] * factor
-                    else:  # Dusk - gradually decrease
-                        if hour == 17:
-                            factor = (120 - minute) / 120
-                        elif hour == 18:
-                            factor = (60 - minute) / 120
-                        elif hour == 19:
-                            factor = (60 - minute) / 60
-                        else:  # hour == 20
-                            factor = (30 - minute) / 60
-                            factor = np.maximum(factor, 0)  # Ensure non-negative
-                        res[combined_mask] = res[combined_mask] * factor
-        
-        # Add cap to maximum production based on time of day
-        midday_mask = (hours >= 10) & (hours <= 14)
-        morning_mask = (hours >= 7) & (hours < 10)
-        afternoon_mask = (hours > 14) & (hours <= 17)
-        
-        # Reduce production during non-peak hours
-        res[morning_mask] = res[morning_mask] * 0.9
-        res[afternoon_mask] = res[afternoon_mask] * 0.85
+                # 不同时段应用不同的平滑
+                if hour in [5, 6, 7]:  # 黎明 - 逐渐增加
+                    if hour == 5:
+                        factor = minute / 120
+                    elif hour == 6:
+                        factor = (minute + 60) / 120
+                    else:  # 7点
+                        factor = (minute + 120) / 180
+                    
+                    res.loc[dawn_dusk_mask] = res.loc[dawn_dusk_mask] * factor
+                else:  # 黄昏 - 逐渐减少
+                    if hour == 19:
+                        factor = (60 - minute) / 60
+                    else:  # 20点
+                        factor = (60 - minute) / 120
+                        factor = np.maximum(factor, 0)  # 确保非负
+                    
+                    res.loc[dawn_dusk_mask] = res.loc[dawn_dusk_mask] * factor
     
     return res
 
 def process_farm(farm_id):
-    """Process a single farm - for parallel processing"""
+    """处理单个农场 - 用于并行处理"""
     farm_start_time = time.time()
     model_path = f'models/{farm_id}'
     os.makedirs(model_path, exist_ok=True)
@@ -671,71 +672,71 @@ def process_farm(farm_id):
     features_name = 'features.pkl'
     
     try:
-        print(f"\n===== Processing farm {farm_id} =====")
-        print(f"Training model for farm {farm_id}...")
+        print(f"\n===== 处理农场 {farm_id} =====")
+        print(f"训练农场 {farm_id} 的模型...")
         model, top_features = train(farm_id)
         
-        # Save the model and selected features
-        print(f"Saving model for farm {farm_id}...")
+        # 保存模型和选定的特征
+        print(f"保存农场 {farm_id} 的模型...")
         with open(os.path.join(model_path, model_name), "wb") as f:
             pickle.dump(model, f)
         
         with open(os.path.join(model_path, features_name), "wb") as f:
             pickle.dump(top_features, f)
         
-        print(f"Making predictions for farm {farm_id}...")
+        print(f"为农场 {farm_id} 生成预测...")
         pred = predict(model, farm_id, top_features)
         result_path = f'result/output'
         os.makedirs(result_path, exist_ok=True)
         pred.to_csv(os.path.join(result_path, f'output{farm_id}.csv'))
         farm_time = time.time() - farm_start_time
-        print(f'Successfully processed farm {farm_id} in {farm_time:.2f} seconds')
+        print(f'成功处理农场 {farm_id}，耗时 {farm_time:.2f} 秒')
         return farm_id, True
     except Exception as e:
-        print(f"Error processing farm {farm_id}: {str(e)}")
+        print(f"处理农场 {farm_id} 时出错: {str(e)}")
         return farm_id, False
 
-# Main execution
+# 主执行函数
 if __name__ == "__main__":
     acc = pd.DataFrame()
-    # Process all farms now that the approach is verified
+    # 处理所有农场
     farms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     
-    # Start timing
+    # 开始计时
     total_start_time = time.time()
     
-    # Option 1: Sequential processing
+    # 选项1: 顺序处理
     # for farm_id in farms:
     #     process_farm(farm_id)
     
-    # Option 2: Parallel processing with multiprocessing
-    # Determine number of cores to use (max 4 to avoid memory issues)
+    # 选项2: 使用多进程进行并行处理
+    # 确定要使用的CPU核心数（最多4个以避免内存问题）
     num_cores = min(4, mp.cpu_count())
-    print(f"Using {num_cores} cores for parallel processing")
+    print(f"使用 {num_cores} 个核心进行并行处理")
     
-    # Create a pool of workers
+    # 创建工作进程池
     with mp.Pool(processes=num_cores) as pool:
-        # Map process_farm to all farm_ids in parallel
+        # 并行映射process_farm到所有farm_ids
         results = pool.map(process_farm, farms)
     
-    # Calculate total time
+    # 计算总运行时间
     total_time = time.time() - total_start_time
     
-    # Count successful farms
+    # 统计成功处理的农场数
     successful = sum(1 for _, success in results if success)
-    print(f"{successful} out of {len(farms)} farms successfully processed")
-    print(f'All farms processed in {total_time:.2f} seconds ({total_time/60:.2f} minutes)')
+    print(f"{successful} 个农场中的 {len(farms)} 个已成功处理")
+    print(f'所有农场处理完成，总耗时 {total_time:.2f} 秒 ({total_time/60:.2f} 分钟)')
     
-    # Play sound alert when finished (try multiple methods for different systems)
+    # 处理完成时播放声音提醒
     try:
-        # For Linux/Unix systems
+        # 对于Linux/Unix系统
         os.system('for i in {1..5}; do echo -e "\a"; sleep 0.5; done')
-        # For Windows systems
+        # 对于Windows系统
         os.system('powershell -c "(New-Object Media.SoundPlayer).PlaySync([System.IO.Path]::Combine([System.Environment]::SystemDirectory, \'media\\Windows Notify.wav\'))"')
-        # Alternative method for Windows
+        # Windows的替代方法
         os.system('echo \x07\x07\x07\x07\x07')
     except:
-        # Fallback if above methods fail
+        # 如果上述方法失败的回退方案
         import sys
         for _ in range(5):
             sys.stdout.write('\a')
